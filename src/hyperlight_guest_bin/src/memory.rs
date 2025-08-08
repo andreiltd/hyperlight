@@ -193,3 +193,30 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
         new_ptr
     }
 }
+
+/// Returns the usable size of the memory block pointed to by `ptr`.
+/// This is the actual amount of memory that can be used, which may be
+/// larger than the originally requested size due to alignment and allocator overhead.
+///
+/// # Safety
+/// `ptr` must be a pointer to a memory block previously allocated by the allocator functions
+/// in this module, or null (in which case 0 is returned).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn malloc_usable_size(ptr: *mut c_void) -> usize {
+    if ptr.is_null() {
+        return 0;
+    }
+
+    unsafe {
+        let user_ptr = ptr as *const u8;
+
+        // Read the Header just before the user data
+        let header_ptr = user_ptr.sub(HEADER_LEN).cast::<Header>();
+        let layout = header_ptr.read().0;
+        let offset = HEADER_LEN.next_multiple_of(layout.align());
+
+        // The usable size is the total allocated size minus the offset to user data
+        // This gives us the actual bytes available to the user
+        layout.size() - offset
+    }
+}

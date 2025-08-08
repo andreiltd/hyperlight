@@ -146,11 +146,29 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     unsafe { abort_with_code_and_message(&[ErrorCode::UnknownError as u8], c_string.as_ptr()) }
 }
 
+pub unsafe fn call_ctors() {
+    let ctors = unsafe {
+        let start = &__init_array_start as *const extern "C" fn() as *const extern "C" fn();
+        let end = &__init_array_end as *const extern "C" fn() as *const extern "C" fn();
+
+        let count = (end as usize - start as usize) / core::mem::size_of::<extern "C" fn()>();
+        core::slice::from_raw_parts(start, count)
+    };
+
+    for ctor in ctors {
+        ctor();
+    }
+}
+
 // === Entrypoint ===
 
 unsafe extern "C" {
     fn hyperlight_main();
     fn srand(seed: u32);
+
+    // TODO(tandr): Use weak symbols or hide behind a feature flag
+    static __init_array_start: extern "C" fn();
+    static __init_array_end: extern "C" fn();
 }
 
 static INIT: Once = Once::new();
@@ -209,6 +227,9 @@ pub extern "C" fn entrypoint(peb_address: u64, seed: u64, ops: u64, max_log_leve
             trace!("hyperlight_main",
                 hyperlight_main();
             );
+
+            call_ctors();
+            hyperlight_main();
         }
     });
 
