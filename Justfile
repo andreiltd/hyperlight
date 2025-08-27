@@ -43,7 +43,7 @@ build target=default-target:
 guests: build-and-move-rust-guests build-and-move-c-guests
 
 ensure-cargo-hyperlight:
-    {{ if os() == "windows" { "if (-not (Get-Command cargo-hyperlight -ErrorAction SilentlyContinue)) { cargo install --locked cargo-hyperlight }" } else { "command -v cargo-hyperlight >/dev/null 2>&1 || cargo install --locked cargo-hyperlight" } }}
+    cargo install --locked --force --git https://github.com/hyperlight-dev/cargo-hyperlight --branch picolibc cargo-hyperlight
 
 witguest-wit:
     {{ if os() == "windows" { "if (-not (Get-Command wasm-tools -ErrorAction SilentlyContinue)) { cargo install --locked wasm-tools }" } else { "command -v wasm-tools >/dev/null 2>&1 || cargo install --locked wasm-tools" } }}
