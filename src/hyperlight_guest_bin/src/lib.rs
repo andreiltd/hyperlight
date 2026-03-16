@@ -53,7 +53,7 @@ pub mod paging;
 
 /// Bridge between picolibc's POSIX expectations and the Hyperlight host.
 #[cfg(feature = "libc")]
-mod host_bridge;
+mod libc;
 
 // Globals
 #[cfg(feature = "mem_profile")]

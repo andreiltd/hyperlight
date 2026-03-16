@@ -13,25 +13,35 @@ script compiles picolibc from source using the vendored submodule at
 `src/hyperlight_guest_bin/third_party/picolibc`.
 
 The build uses a sparse checkout to exclude GPL/AGPL-licensed test and script
-files — only BSD/MIT/permissive-licensed source files are included. See
+files and only BSD/MIT/permissive-licensed source files are included. See
 `NOTICE.txt` for full licensing details.
 
 ## Host Function Stubs
 
 When the `libc` feature is enabled, the POSIX stubs in
-`src/hyperlight_guest_bin/src/host_bridge.rs` provide C-compatible
+`src/hyperlight_guest_bin/src/libc.rs` provide C-compatible
 implementations of `read`, `write`, `clock_gettime`, `gettimeofday`, and
 other functions that picolibc calls internally.
 
-These stubs can optionally delegate to host functions. If the host registers
-these functions, the corresponding libc functionality becomes available to
-guest code. If not registered, the stubs return appropriate errors.
+### Read (stdin)
 
-| Host Function   | Parameters             | Return Type | Description |
-|-----------------|------------------------|-------------|-------------|
-| `HostPrint`     | `String`               | `Int`       | Used by the `write()` stub. Only stdout (fd 1) and stderr (fd 2) are supported; both delegate to this single host function. Other file descriptors return `EBADF`. |
-| `HostRead`      | `ULong` (byte count)   | `VecBytes`  | Used by the `read()` stub. Only stdin (fd 0) is supported; other file descriptors return `EBADF`. |
-| `CurrentTime`   | _(none)_               | `VecBytes`  | Used by `clock_gettime()` and `gettimeofday()`. Should return 16 bytes: 8 bytes of seconds + 8 bytes of nanoseconds. If not provided, a monotonic fallback starting at Unix timestamp `1609459200` (2021-01-01) is used. |
+The `read()` stub returns **EOF (0)** immediately for stdin (fd 0) without
+contacting the host. Other file descriptors return `EBADF`.
+
+### Write (stdout / stderr)
+
+The `write()` stub delegates to the `HostPrint` host function. Only stdout
+(fd 1) and stderr (fd 2) are supported; both map to the same `HostPrint`
+call, which accepts a `String` parameter and returns an `Int`. Other file
+descriptors return `EBADF`.
+
+### Time
+
+The `clock_gettime()`, `gettimeofday()`, and `_current_time()` stubs do
+**not** call out to the host. Instead they return a synthetic
+monotonically-increasing timestamp: the first call returns Unix epoch + 1 s
+(`1970-01-01 00:00:01`), the second returns epoch + 2 s, and so on. The
+nanosecond/microsecond component is always zero.
 
 ## Build Configuration
 

@@ -16,7 +16,6 @@ limitations under the License.
 
 use alloc::string::String;
 use alloc::vec;
-use alloc::vec::Vec;
 use core::ffi::*;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -45,33 +44,25 @@ const CLOCK_MONOTONIC: c_ulong = 4;
 
 static CURRENT_TIME: AtomicU64 = AtomicU64::new(0);
 
-/// Matches picolibc `struct timespec` layout for x86_64.
+/// Matches picolibc `struct timespec` layout for x86_64 and aarch64.
 #[repr(C)]
 pub(crate) struct Timespec {
     tv_sec: c_long,
     tv_nsec: c_long,
 }
 
-/// Matches picolibc `struct timeval` layout for x86_64.
+/// Matches picolibc `struct timeval` layout for x86_64 and aarch64.
 #[repr(C)]
 pub(crate) struct Timeval {
     tv_sec: c_long,
     tv_usec: c_long,
 }
 
-/// Retrieves the current time from the host as (seconds, nanoseconds).
+/// Returns a synthetic monotonically-increasing time starting at Unix epoch
+/// increasing 1s each call.
 fn current_time() -> (u64, u64) {
-    let bytes = call_host_function::<Vec<u8>>("CurrentTime", Some(vec![]), ReturnType::VecBytes)
-        .unwrap_or_default();
-
-    if bytes.len() == 16 {
-        let secs = u64::from_ne_bytes(bytes[0..8].try_into().unwrap());
-        let nanos = u64::from_ne_bytes(bytes[8..16].try_into().unwrap());
-        (secs, nanos)
-    } else {
-        let secs = 1609459200 + CURRENT_TIME.fetch_add(1, Ordering::Relaxed);
-        (secs, 0)
-    }
+    let call_count = CURRENT_TIME.fetch_add(1, Ordering::Relaxed) + 1;
+    (call_count, 0)
 }
 
 #[unsafe(no_mangle)]
@@ -86,23 +77,9 @@ pub extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
         return -1;
     }
 
-    match call_host_function::<Vec<u8>>(
-        "HostRead",
-        Some(vec![ParameterValue::ULong(count as u64)]),
-        ReturnType::VecBytes,
-    ) {
-        Ok(bytes) => {
-            let n = bytes.len().min(count);
-            unsafe {
-                core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
-            }
-            n as isize
-        }
-        Err(_) => {
-            set_errno(EIO);
-            -1
-        }
-    }
+    // Return EOF immediately — no host round-trip required.
+    let _ = (buf, count);
+    0
 }
 
 #[unsafe(no_mangle)]
