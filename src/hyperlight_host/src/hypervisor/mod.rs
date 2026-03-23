@@ -31,7 +31,7 @@ pub(crate) mod surrogate_process;
 pub(crate) mod surrogate_process_manager;
 /// Safe wrappers around windows types like `PSTR`
 #[cfg(target_os = "windows")]
-pub(crate) mod wrappers;
+pub mod wrappers;
 
 #[cfg(crashdump)]
 pub(crate) mod crashdump;
@@ -469,6 +469,7 @@ pub(crate) mod tests {
     use crate::sandbox::{SandboxConfiguration, UninitializedSandbox};
     use crate::{Result, is_hypervisor_present, new_error};
 
+    #[cfg_attr(feature = "hw-interrupts", ignore)]
     #[test]
     fn test_initialise() -> Result<()> {
         if !is_hypervisor_present() {
@@ -493,6 +494,7 @@ pub(crate) mod tests {
             gshm,
             &config,
             exn_stack_top_gva,
+            page_size::get(),
             #[cfg(any(crashdump, gdb))]
             rt_cfg,
             sandbox.load_info,

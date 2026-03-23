@@ -63,7 +63,7 @@ limitations under the License.
 use std::fmt::Debug;
 use std::mem::{offset_of, size_of};
 
-use hyperlight_common::mem::{GuestMemoryRegion, HyperlightPEB, PAGE_SIZE_USIZE};
+use hyperlight_common::mem::{HyperlightPEB, PAGE_SIZE_USIZE};
 use tracing::{Span, instrument};
 
 use super::memory_region::MemoryRegionType::{Code, Heap, InitData, Peb};
@@ -92,6 +92,7 @@ pub(crate) struct SandboxMemoryLayout {
     peb_output_data_offset: usize,
     peb_init_data_offset: usize,
     peb_heap_data_offset: usize,
+    peb_file_mappings_offset: usize,
 
     guest_heap_buffer_offset: usize,
     init_data_offset: usize,
@@ -140,6 +141,10 @@ impl Debug for SandboxMemoryLayout {
             .field(
                 "Guest Heap Offset",
                 &format_args!("{:#x}", self.peb_heap_data_offset),
+            )
+            .field(
+                "File Mappings Offset",
+                &format_args!("{:#x}", self.peb_file_mappings_offset),
             )
             .field(
                 "Guest Heap Buffer Offset",
@@ -211,13 +216,25 @@ impl SandboxMemoryLayout {
         let peb_output_data_offset = peb_offset + offset_of!(HyperlightPEB, output_stack);
         let peb_init_data_offset = peb_offset + offset_of!(HyperlightPEB, init_data);
         let peb_heap_data_offset = peb_offset + offset_of!(HyperlightPEB, guest_heap);
+        let peb_file_mappings_offset = peb_offset + offset_of!(HyperlightPEB, file_mappings);
 
         // The following offsets are the actual values that relate to memory layout,
         // which are written to PEB struct
         let peb_address = Self::BASE_ADDRESS + peb_offset;
-        // make sure heap buffer starts at 4K boundary
-        let guest_heap_buffer_offset = (peb_heap_data_offset + size_of::<GuestMemoryRegion>())
-            .next_multiple_of(PAGE_SIZE_USIZE);
+        // make sure heap buffer starts at 4K boundary.
+        // The FileMappingInfo array is stored immediately after the PEB struct.
+        // We statically reserve space for MAX_FILE_MAPPINGS entries so that
+        // the heap never overlaps the array, even when all slots are used.
+        // The host writes file mapping metadata here via write_file_mapping_entry;
+        // the guest only reads the entries. We don't know at layout time how
+        // many file mappings the host will register, so we reserve space for
+        // the maximum number.
+        // The heap starts at the next page boundary after this reserved area.
+        let file_mappings_array_end = peb_offset
+            + size_of::<HyperlightPEB>()
+            + hyperlight_common::mem::MAX_FILE_MAPPINGS
+                * size_of::<hyperlight_common::mem::FileMappingInfo>();
+        let guest_heap_buffer_offset = file_mappings_array_end.next_multiple_of(PAGE_SIZE_USIZE);
 
         // make sure init data starts at 4K boundary
         let init_data_offset =
@@ -230,6 +247,7 @@ impl SandboxMemoryLayout {
             peb_output_data_offset,
             peb_init_data_offset,
             peb_heap_data_offset,
+            peb_file_mappings_offset,
             sandbox_memory_config: cfg,
             code_size,
             guest_heap_buffer_offset,
@@ -350,6 +368,28 @@ impl SandboxMemoryLayout {
         self.peb_heap_data_offset
     }
 
+    /// Get the offset in guest memory to the file_mappings count field
+    /// (the `size` field of the `GuestMemoryRegion` in the PEB).
+    pub(crate) fn get_file_mappings_size_offset(&self) -> usize {
+        self.peb_file_mappings_offset
+    }
+
+    /// Get the offset in guest memory to the file_mappings pointer field.
+    fn get_file_mappings_pointer_offset(&self) -> usize {
+        self.get_file_mappings_size_offset() + size_of::<u64>()
+    }
+
+    /// Get the offset in snapshot memory where the FileMappingInfo array starts
+    /// (immediately after the PEB struct, within the same page).
+    pub(crate) fn get_file_mappings_array_offset(&self) -> usize {
+        self.peb_offset + size_of::<HyperlightPEB>()
+    }
+
+    /// Get the guest address of the FileMappingInfo array.
+    fn get_file_mappings_array_gva(&self) -> u64 {
+        (Self::BASE_ADDRESS + self.get_file_mappings_array_offset()) as u64
+    }
+
     /// Get the offset of the heap pointer in guest memory,
     #[instrument(skip_all, parent = Span::current(), level= "Trace")]
     fn get_heap_pointer_offset(&self) -> usize {
@@ -446,9 +486,12 @@ impl SandboxMemoryLayout {
             ));
         }
 
-        // PEB
+        // PEB + preallocated FileMappingInfo array
+        let peb_and_array_size = size_of::<HyperlightPEB>()
+            + hyperlight_common::mem::MAX_FILE_MAPPINGS
+                * size_of::<hyperlight_common::mem::FileMappingInfo>();
         let heap_offset = builder.push_page_aligned(
-            size_of::<HyperlightPEB>(),
+            peb_and_array_size,
             MemoryRegionFlags::READ | MemoryRegionFlags::WRITE,
             Peb,
         );
@@ -588,6 +631,18 @@ impl SandboxMemoryLayout {
         shared_mem.write_u64(self.get_heap_size_offset(), self.heap_size.try_into()?)?;
         shared_mem.write_u64(self.get_heap_pointer_offset(), addr)?;
 
+        // Set up the file_mappings descriptor in the PEB.
+        // - The `size` field holds the number of valid FileMappingInfo
+        //   entries currently written (initially 0 — entries are added
+        //   later by map_file_cow / evolve).
+        // - The `ptr` field holds the guest address of the preallocated
+        //   FileMappingInfo array
+        shared_mem.write_u64(self.get_file_mappings_size_offset(), 0)?;
+        shared_mem.write_u64(
+            self.get_file_mappings_pointer_offset(),
+            self.get_file_mappings_array_gva(),
+        )?;
+
         // End of setting up the PEB
 
         // The input and output data regions do not have their layout
@@ -611,7 +666,11 @@ mod tests {
         // in order of layout
         expected_size += layout.code_size;
 
-        expected_size += size_of::<HyperlightPEB>().next_multiple_of(PAGE_SIZE_USIZE);
+        // PEB + preallocated FileMappingInfo array
+        let peb_and_array = size_of::<HyperlightPEB>()
+            + hyperlight_common::mem::MAX_FILE_MAPPINGS
+                * size_of::<hyperlight_common::mem::FileMappingInfo>();
+        expected_size += peb_and_array.next_multiple_of(PAGE_SIZE_USIZE);
 
         expected_size += layout.heap_size.next_multiple_of(PAGE_SIZE_USIZE);
 

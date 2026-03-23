@@ -129,7 +129,7 @@ impl TryFrom<hv_arm64_memory_intercept_message> for MemoryRegionFlags {
 // and crash dumps. Not part of the public API.
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
 /// The type of memory region
-pub(crate) enum MemoryRegionType {
+pub enum MemoryRegionType {
     /// The region contains the guest's code
     Code,
     /// The region contains the guest's init data
@@ -156,7 +156,7 @@ impl MemoryRegionType {
     /// `MappedFile` regions use read-only file-backed mappings with no
     /// guard pages; all other region types use the standard sandbox
     /// shared memory mapping with guard pages.
-    pub(crate) fn surrogate_mapping(&self) -> SurrogateMapping {
+    pub fn surrogate_mapping(&self) -> SurrogateMapping {
         match self {
             MemoryRegionType::MappedFile => SurrogateMapping::ReadOnlyFile,
             _ => SurrogateMapping::SandboxMemory,
@@ -203,7 +203,7 @@ impl MemoryRegionKind for HostGuestMemoryRegion {
 /// behaviour when projected into the surrogate process via `MapViewOfFileNuma2`.
 #[cfg(target_os = "windows")]
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
-pub(crate) enum SurrogateMapping {
+pub enum SurrogateMapping {
     /// Standard sandbox shared memory: mapped with `PAGE_READWRITE` protection
     /// and guard pages (`PAGE_NOACCESS`) set on the first and last pages.
     SandboxMemory,
@@ -293,7 +293,7 @@ pub struct MemoryRegion_<K: MemoryRegionKind> {
     /// memory access flags for the given region
     pub flags: MemoryRegionFlags,
     /// the type of memory region
-    pub(crate) region_type: MemoryRegionType,
+    pub region_type: MemoryRegionType,
 }
 
 /// A memory region that tracks both host and guest addresses.
