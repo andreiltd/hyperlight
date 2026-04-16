@@ -1,4 +1,4 @@
 [submodule "src/hyperlight_guest_bin/third_party/picolibc"]
 	path = src/hyperlight_guest_bin/third_party/picolibc
-	url = https://github.com/picolibc/picolibc.git
+	url = https://github.com/andreiltd/picolibc-bsd.git
 	shallow = true

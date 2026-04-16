@@ -12,9 +12,10 @@ The picolibc integration is controlled by the `libc` feature flag on the
 script compiles picolibc from source using the vendored submodule at
 `src/hyperlight_guest_bin/third_party/picolibc`.
 
-The build uses a sparse checkout to exclude GPL/AGPL-licensed test and script
-files and only BSD/MIT/permissive-licensed source files are included. See
-`NOTICE.txt` for full licensing details.
+The submodule points to [picolibc-bsd](https://github.com/hyperlight-dev/picolibc-bsd),
+a redistribution of picolibc with all copyleft-licensed files (GPL/AGPL)
+removed from the tree and history. Only BSD/MIT/permissive-licensed source
+files are present. See `NOTICE.txt` for full licensing details.
 
 ## Host Function Stubs
 
@@ -63,33 +64,34 @@ The file list of picolibc sources to compile is maintained in `build_files.rs`.
 
 To update picolibc to a new version:
 
-1. Update the submodule:
+1. Import new upstream commits into the [picolibc-bsd](https://github.com/hyperlight-dev/picolibc-bsd) fork.
+   See `picolibc-bsd` README.md for instructions how to do that. 
+
+2. Update the submodule in hyperlight:
    ```bash
    cd src/hyperlight_guest_bin/third_party/picolibc
    git fetch origin
-   git checkout <new-version-tag>
+   git checkout <new-fork-tag>
    cd ../../../..
    git add src/hyperlight_guest_bin/third_party/picolibc
    ```
 
-2. Verify licensing: Check that no new GPL/AGPL-licensed source files
-   have been added to the directories we compile. The sparse checkout
-   (configured in `build.rs` `sparse_checkout()`) excludes `test/`,
-   `scripts/`, and `COPYING.GPL2`, but review any new files.
+3. Verify licensing: The fork's CI runs scancode-toolkit to ensure no
+   copyleft files are present. Review the CI results on the fork.
 
-3. Update `build_files.rs`: Compare the file list against the new
+4. Update `build_files.rs`: Compare the file list against the new
    version's meson build files. Files may have been added, removed, or
    renamed. The meson build definitions in `libc/meson.build` and
    `libm/meson.build` (and their subdirectory `meson.build` files)
    are the source of truth for which files to compile.
 
-4. Update version strings in `build.rs`: Update the `__PICOLIBC_VERSION__`,
+5. Update version strings in `build.rs`: Update the `__PICOLIBC_VERSION__`,
    `__PICOLIBC__`, `__PICOLIBC_MINOR__`, `__PICOLIBC_PATCHLEVEL__`,
    `_NEWLIB_VERSION`, and related defines in `gen_config_file()`.
 
-5. Update `NOTICE.txt`: Bump the version number in the picolibc entry.
+6. Update `NOTICE.txt`: Bump the version number in the picolibc entry.
 
-6. Build and test:
+7. Build and test:
    ```bash
    just guests
    just test

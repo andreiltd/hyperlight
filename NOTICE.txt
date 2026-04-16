@@ -55,7 +55,8 @@ permissive licenses. The full license details for all files are
 documented in the COPYING.picolibc and COPYING.NEWLIB files in the
 picolibc submodule at src/hyperlight_guest_bin/third_party/picolibc/.
 
-Note: The picolibc submodule uses sparse checkout to exclude
-GPL/AGPL-licensed test and script files that are not needed for
-building. Only BSD/MIT/permissive-licensed source files are included.
+Note: The picolibc submodule uses the picolibc-bsd fork
+(https://github.com/hyperlight-dev/picolibc-bsd), which is a redistribution
+with all copyleft-licensed files removed from the tree and history.
+Only BSD/MIT/permissive-licensed source files are present.
 

@@ -111,6 +111,11 @@ pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _current_time(ts: *mut u64) -> c_int {
+    if ts.is_null() {
+        set_errno(EINVAL);
+        return -1;
+    }
+
     let (secs, nanos) = current_time();
     let ts = unsafe { core::slice::from_raw_parts_mut(ts, 2) };
     ts[0] = secs;

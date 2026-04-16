@@ -309,7 +309,7 @@ fn add_libm(build: &mut cc::Build, picolibc_dir: &Path, target: &str) -> Result<
     Ok(())
 }
 
-fn sparse_checkout() -> Result<()> {
+fn init_submodule() -> Result<()> {
     let status = Command::new("git")
         .args(["submodule", "update", "--init"])
         .status()?;
@@ -317,30 +317,6 @@ fn sparse_checkout() -> Result<()> {
     if !status.success() {
         bail!("git submodule update --init failed");
     }
-
-    // Exclude GPL/AGPL-licensed files from the picolibc submodule
-    Command::new("git")
-        .args([
-            "-C",
-            "third_party/picolibc",
-            "sparse-checkout",
-            "init",
-            "--no-cone",
-        ])
-        .status()?;
-
-    Command::new("git")
-        .args([
-            "-C",
-            "third_party/picolibc",
-            "sparse-checkout",
-            "set",
-            "**",
-            "!test/**",
-            "!scripts/**",
-            "!COPYING.GPL2",
-        ])
-        .status()?;
 
     Ok(())
 }
@@ -360,7 +336,7 @@ fn cargo_main() -> Result<()> {
     if cfg!(feature = "libc") {
         if !Path::new("third_party/picolibc/COPYING.picolibc").exists() {
             eprintln!("Setting up submodules");
-            sparse_checkout().with_context(|| "failed to init picolibc submodule")?;
+            init_submodule().with_context(|| "failed to init picolibc submodule")?;
         }
 
         let picolibc_dir = PathBuf::from("third_party/picolibc");
