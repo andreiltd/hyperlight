@@ -254,8 +254,7 @@ fn cc_build(picolibc_dir: &PathBuf, target: &str) -> Result<cc::Build> {
 
     // TODO: this is wrong, it should generate config file to out_dir/include
     // but how downstream crates get at it then? And TBH I think having piclibc
-    // headers (features.h) depend on a build time header is wrong is odd to say
-    // at least.
+    // headers (features.h) depend on a build time header is odd
     gen_config_file(&picolibc_dir.join("libc/include"))?;
 
     match target {
