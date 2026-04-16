@@ -13,3 +13,5 @@ fpr="fpr"
 consts="consts"
 # ist is an acronym for Interrupt Stack Table, not a missspelling of its
 ist="ist"
+# writables as number of writable buffers
+writables="writables"
