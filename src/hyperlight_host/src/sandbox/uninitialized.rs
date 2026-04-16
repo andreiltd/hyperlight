@@ -362,10 +362,8 @@ impl UninitializedSandbox {
             }
         };
 
-        let mut mem_mgr_wrapper =
+        let mem_mgr_wrapper =
             SandboxMemoryManager::<ExclusiveSharedMemory>::from_snapshot(snapshot.as_ref())?;
-
-        mem_mgr_wrapper.write_memory_layout()?;
 
         let host_funcs = Arc::new(Mutex::new(FunctionRegistry::default()));
 

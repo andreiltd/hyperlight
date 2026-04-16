@@ -26,14 +26,14 @@ gdbstub_arch = { version = "0.3.3", optional = true }
 goblin = { version = "0.10", default-features = false, features = ["std", "elf32", "elf64", "endian_fd"] }
 rand = { version = "0.10" }
 cfg-if = { version = "1.0.4" }
-libc = { version = "0.2.183" }
+libc = { version = "0.2.185" }
 flatbuffers = "25.12.19"
 framehop = { version = "0.15.0", optional = true }
 fallible-iterator = { version = "0.3.0", optional = true }
-blake3 = "1.8.3"
+blake3 = "1.8.4"
 page_size = "0.6.0"
 termcolor = "1.2.0"
-bitflags = "2.11.0"
+bitflags = "2.11.1"
 log = "0.4.29"
 opentelemetry = { version = "0.31.0", optional = true }
 tracing = { version = "0.1.44", features = ["log"] }
@@ -50,7 +50,7 @@ anyhow = "1.0"
 metrics = "0.24.3"
 serde_json = "1.0"
 elfcore = { version = "2.0", optional = true }
-uuid = { version = "1.22.0", features = ["v4"] }
+uuid = { version = "1.23.0", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -70,7 +70,6 @@ windows = { version = "0.62", features = [
 windows-sys = { version = "0.61", features = ["Win32"] }
 windows-result = "0.4"
 rust-embed = { version = "8.11.0", features = ["debug-embed", "include-exclude", "interpolate-folder-path"] }
-sha256 = "1.6.0"
 windows-version = "0.1"
 lazy_static = "1.4.0"
 
@@ -81,17 +80,17 @@ mshv-bindings = { version = "0.6", optional = true }
 mshv-ioctls = { version = "0.6", optional = true}
 
 [dev-dependencies]
-uuid = { version = "1.22.0", features = ["v4"] }
+uuid = { version = "1.23.0", features = ["v4"] }
 signal-hook-registry = "1.4.8"
 serde = "1.0"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "code_asm"] }
-proptest = "1.10.0"
+proptest = "1.11.0"
 tempfile = "3.27.0"
 crossbeam-queue = "0.3.12"
 tracing-serde = "0.2.0"
 serial_test = "3.4.0"
 hyperlight-testing = { workspace = true }
-env_logger = "0.11.8"
+env_logger = "0.11.10"
 tracing-forest = { version = "0.3.1", features = ["uuid", "chrono", "smallvec", "serde", "env-filter"] }
 tracing = "0.1.44"
 tracing-subscriber = {version = "0.3.23", features = ["std", "env-filter"]}
@@ -100,7 +99,7 @@ opentelemetry = "0.31.0"
 opentelemetry-otlp = { version = "0.31.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "grpc-tonic"] }
 opentelemetry-semantic-conventions = "0.31"
 opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
-tokio = { version = "1.50.0", features = ["full"] }
+tokio = { version = "1.52.0", features = ["full"] }
 criterion = "0.8.2"
 tracing-chrome = "0.7.2"
 metrics-util = "0.20.1"

@@ -103,13 +103,13 @@ impl<const NAME_SZ: usize, const DESC_SZ: usize> ElfNote<NAME_SZ, DESC_SZ> {
 
         // desc must start at an 8-byte aligned offset from the note start.
         assert!(
-            core::mem::offset_of!(Self, desc) % 8 == 0,
+            core::mem::offset_of!(Self, desc).is_multiple_of(8),
             "desc is not 8-byte aligned"
         );
 
         // Total note size must be a multiple of 8 for next-entry alignment.
         assert!(
-            size_of::<Self>() % 8 == 0,
+            size_of::<Self>().is_multiple_of(8),
             "total note size is not 8-byte aligned"
         );
 

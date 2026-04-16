@@ -185,6 +185,12 @@ pub trait MemoryRegionKind {
 
 /// Type for memory regions that track both host and guest addresses.
 ///
+/// When one of these is created, it always ends up in a sandbox
+/// quickly. It's an invariant of this type that as long as one of
+/// these is associated with a sandbox, it's always acceptable to read
+/// from it, since a lot of the debug/crashdump/snapshot code
+/// does. (Note: this means that _writable_ HostGuestMemoryRegions are
+/// not possible to support at the moment).
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
 pub struct HostGuestMemoryRegion {}
 
@@ -323,7 +329,7 @@ impl MemoryRegionKind for CrashDumpMemoryRegion {
 #[cfg(crashdump)]
 pub(crate) type CrashDumpRegion = MemoryRegion_<CrashDumpMemoryRegion>;
 
-#[cfg(crashdump)]
+#[cfg(all(crashdump, feature = "nanvix-unstable"))]
 impl HostGuestMemoryRegion {
     /// Extract the raw `usize` host address from the platform-specific
     /// host base type.

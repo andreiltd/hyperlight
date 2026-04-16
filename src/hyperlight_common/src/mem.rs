@@ -77,5 +77,6 @@ pub struct HyperlightPEB {
     /// [`FileMappingInfo`] entries), NOT a byte size. `ptr` holds the
     /// guest address of the preallocated array (immediately after the
     /// PEB struct).
+    #[cfg(feature = "nanvix-unstable")]
     pub file_mappings: GuestMemoryRegion,
 }

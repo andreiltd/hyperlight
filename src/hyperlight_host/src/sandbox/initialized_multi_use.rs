@@ -562,11 +562,13 @@ impl MultiUseSandbox {
 
         // Pre-check the file mapping limit before doing any expensive
         // OS or VM work. The PEB count is the source of truth.
+        #[cfg(feature = "nanvix-unstable")]
         let current_count = self
             .mem_mgr
             .shared_mem
             .read::<u64>(self.mem_mgr.layout.get_file_mappings_size_offset())?
             as usize;
+        #[cfg(feature = "nanvix-unstable")]
         if current_count >= hyperlight_common::mem::MAX_FILE_MAPPINGS {
             return Err(crate::HyperlightError::Error(format!(
                 "map_file_cow: file mapping limit reached ({} of {})",
@@ -638,6 +640,7 @@ impl MultiUseSandbox {
         // still holds a valid mapping but the PEB won't list it — the
         // limit was already pre-checked above so this should not fail
         // in practice.
+        #[cfg(feature = "nanvix-unstable")]
         self.mem_mgr
             .write_file_mapping_entry(prepared.guest_base, size, &prepared.label)?;
 
@@ -732,6 +735,9 @@ impl MultiUseSandbox {
                 }
             }
         })();
+
+        // Clear partial abort bytes so they don't leak across calls.
+        self.mem_mgr.abort_buffer.clear();
 
         // In the happy path we do not need to clear io-buffers from the host because:
         // - the serialized guest function call is zeroed out by the guest during deserialization, see call to `try_pop_shared_input_data_into::<FunctionCall>()`
@@ -1464,6 +1470,33 @@ mod tests {
         );
     }
 
+    /// Test that stale abort buffer bytes from a previous call don't
+    /// leak into the next call.
+    #[test]
+    fn stale_abort_buffer_does_not_leak_across_calls() {
+        let mut sbox: MultiUseSandbox = {
+            let path = simple_guest_as_string().unwrap();
+            let u_sbox = UninitializedSandbox::new(GuestBinary::FilePath(path), None).unwrap();
+            u_sbox.evolve().unwrap()
+        };
+
+        // Simulate a partial abort
+        sbox.mem_mgr.abort_buffer.extend_from_slice(&[0xAA; 1020]);
+
+        let res = sbox.call::<String>("Echo", "hello".to_string());
+        assert!(
+            res.is_ok(),
+            "Expected Ok after stale abort buffer, got: {:?}",
+            res.unwrap_err()
+        );
+
+        // The buffer should be empty after the call.
+        assert!(
+            sbox.mem_mgr.abort_buffer.is_empty(),
+            "abort_buffer should be empty after a guest call"
+        );
+    }
+
     /// Test that sandboxes can be created and evolved with different heap sizes
     #[test]
     fn test_sandbox_creation_various_sizes() {
@@ -2105,6 +2138,7 @@ mod tests {
     /// the FileMappingInfo entry (count, guest_addr, size, label) into
     /// the PEB.
     #[test]
+    #[cfg(feature = "nanvix-unstable")]
     fn test_map_file_cow_peb_entry_multiuse() {
         use std::mem::offset_of;
 
@@ -2180,6 +2214,7 @@ mod tests {
     /// Tests that deferred `map_file_cow` (before evolve) correctly
     /// writes FileMappingInfo entries into the PEB during evolve.
     #[test]
+    #[cfg(feature = "nanvix-unstable")]
     fn test_map_file_cow_peb_entry_deferred() {
         use std::mem::offset_of;
 
@@ -2253,6 +2288,7 @@ mod tests {
     /// populates all PEB FileMappingInfo slots with the right guest_addr,
     /// size, and label for each entry.
     #[test]
+    #[cfg(feature = "nanvix-unstable")]
     fn test_map_file_cow_peb_multiple_entries() {
         use std::mem::{offset_of, size_of};
 

@@ -74,7 +74,7 @@ impl HyperlightVm {
     #[instrument(err(Debug), skip_all, parent = Span::current(), level = "Trace")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        snapshot_mem: GuestSharedMemory,
+        snapshot_mem: SnapshotSharedMemory<GuestSharedMemory>,
         scratch_mem: GuestSharedMemory,
         _pml4_addr: u64,
         entrypoint: NextAction,
@@ -405,7 +405,7 @@ impl HyperlightVm {
                 self.send_dbg_msg(DebugResponse::VcpuStopped(stop_reason))?;
 
                 loop {
-                    log::debug!("Debug wait for event to resume vCPU");
+                    tracing::debug!("Debug wait for event to resume vCPU");
                     // Wait for a message from gdb
                     let req = self.recv_dbg_msg()?;
 
@@ -447,7 +447,7 @@ impl HyperlightVm {
                                     _,
                                 ))) => DebugResponse::ErrorOccurred,
                                 Err(e) => {
-                                    log::error!("Error processing debug request: {:?}", e);
+                                    tracing::error!("Error processing debug request: {:?}", e);
                                     return Err(HandleDebugError::ProcessRequest(e));
                                 }
                             }
@@ -478,7 +478,7 @@ impl HyperlightVm {
                 self.send_dbg_msg(DebugResponse::VcpuStopped(stop_reason))?;
 
                 loop {
-                    log::debug!("Debug wait for event to resume vCPU");
+                    tracing::debug!("Debug wait for event to resume vCPU");
                     // Wait for a message from gdb
                     let req = self.recv_dbg_msg()?;
 
@@ -640,7 +640,7 @@ pub(super) mod debug {
                         self.vm
                             .add_hw_breakpoint(addr)
                             .map_err(|e| {
-                                log::error!("Failed to add hw breakpoint: {:?}", e);
+                                tracing::error!("Failed to add hw breakpoint: {:?}", e);
 
                                 e
                             })
@@ -649,7 +649,7 @@ pub(super) mod debug {
                     DebugMsg::AddSwBreakpoint(addr) => Ok(DebugResponse::AddSwBreakpoint(
                         self.add_sw_breakpoint(addr, mem_access)
                             .map_err(|e| {
-                                log::error!("Failed to add sw breakpoint: {:?}", e);
+                                tracing::error!("Failed to add sw breakpoint: {:?}", e);
 
                                 e
                             })
@@ -657,7 +657,7 @@ pub(super) mod debug {
                     )),
                     DebugMsg::Continue => {
                         self.vm.set_single_step(false).map_err(|e| {
-                            log::error!("Failed to continue execution: {:?}", e);
+                            tracing::error!("Failed to continue execution: {:?}", e);
 
                             e
                         })?;
@@ -666,7 +666,7 @@ pub(super) mod debug {
                     }
                     DebugMsg::DisableDebug => {
                         self.vm.set_debug(false).map_err(|e| {
-                            log::error!("Failed to disable debugging: {:?}", e);
+                            tracing::error!("Failed to disable debugging: {:?}", e);
                             e
                         })?;
 
@@ -686,7 +686,7 @@ pub(super) mod debug {
                         let mut data = vec![0u8; len];
 
                         self.read_addrs(addr, &mut data, mem_access).map_err(|e| {
-                            log::error!("Failed to read from address: {:?}", e);
+                            tracing::error!("Failed to read from address: {:?}", e);
 
                             e
                         })?;
@@ -702,7 +702,7 @@ pub(super) mod debug {
                         self.vm
                             .remove_hw_breakpoint(addr)
                             .map_err(|e| {
-                                log::error!("Failed to remove hw breakpoint: {:?}", e);
+                                tracing::error!("Failed to remove hw breakpoint: {:?}", e);
 
                                 e
                             })
@@ -711,7 +711,7 @@ pub(super) mod debug {
                     DebugMsg::RemoveSwBreakpoint(addr) => Ok(DebugResponse::RemoveSwBreakpoint(
                         self.remove_sw_breakpoint(addr, mem_access)
                             .map_err(|e| {
-                                log::error!("Failed to remove sw breakpoint: {:?}", e);
+                                tracing::error!("Failed to remove sw breakpoint: {:?}", e);
 
                                 e
                             })
@@ -719,7 +719,7 @@ pub(super) mod debug {
                     )),
                     DebugMsg::Step => {
                         self.vm.set_single_step(true).map_err(|e| {
-                            log::error!("Failed to enable step instruction: {:?}", e);
+                            tracing::error!("Failed to enable step instruction: {:?}", e);
 
                             e
                         })?;
@@ -728,7 +728,7 @@ pub(super) mod debug {
                     }
                     DebugMsg::WriteAddr(addr, data) => {
                         self.write_addrs(addr, &data, mem_access).map_err(|e| {
-                            log::error!("Failed to write to address: {:?}", e);
+                            tracing::error!("Failed to write to address: {:?}", e);
 
                             e
                         })?;
@@ -767,7 +767,7 @@ pub(super) mod debug {
         ) -> std::result::Result<(), super::SendDbgMsgError> {
             use super::SendDbgMsgError;
 
-            log::debug!("Sending {:?}", cmd);
+            tracing::debug!("Sending {:?}", cmd);
 
             let gdb_conn = self
                 .gdb_conn
@@ -784,7 +784,7 @@ pub(super) mod debug {
             mem_access: &DebugMemoryAccess,
         ) -> std::result::Result<(), ProcessDebugRequestError> {
             let data_len = data.len();
-            log::debug!("Read addr: {:X} len: {:X}", gva, data_len);
+            tracing::debug!("Read addr: {:X} len: {:X}", gva, data_len);
 
             while !data.is_empty() {
                 let gpa = self.vm.translate_gva(gva)?;
@@ -812,7 +812,7 @@ pub(super) mod debug {
             mem_access: &DebugMemoryAccess,
         ) -> std::result::Result<(), ProcessDebugRequestError> {
             let data_len = data.len();
-            log::debug!("Write addr: {:X} len: {:X}", gva, data_len);
+            tracing::debug!("Write addr: {:X} len: {:X}", gva, data_len);
 
             while !data.is_empty() {
                 let gpa = self.vm.translate_gva(gva)?;
@@ -891,7 +891,7 @@ mod tests {
     use crate::mem::memory_region::{GuestMemoryRegion, MemoryRegionFlags};
     use crate::mem::mgr::{GuestPageTableBuffer, SandboxMemoryManager};
     use crate::mem::ptr::RawPtr;
-    use crate::mem::shared_mem::ExclusiveSharedMemory;
+    use crate::mem::shared_mem::{ExclusiveSharedMemory, ReadonlySharedMemory};
     use crate::sandbox::SandboxConfiguration;
     use crate::sandbox::host_funcs::FunctionRegistry;
     #[cfg(any(crashdump, gdb))]
@@ -1485,20 +1485,22 @@ mod tests {
         layout.set_pt_size(pt_bytes.len()).unwrap();
 
         let mem_size = layout.get_memory_size().unwrap();
-        let mut eshm = ExclusiveSharedMemory::new(mem_size).unwrap();
+        let mut snapshot_contents = vec![0u8; mem_size];
         let snapshot_pt_start = mem_size - layout.get_pt_size();
-        eshm.copy_from_slice(&pt_bytes, snapshot_pt_start).unwrap();
-        eshm.copy_from_slice(code, layout.get_guest_code_offset())
-            .unwrap();
+        snapshot_contents[snapshot_pt_start..].copy_from_slice(&pt_bytes);
+        snapshot_contents
+            [layout.get_guest_code_offset()..layout.get_guest_code_offset() + code.len()]
+            .copy_from_slice(code);
+        layout.write_peb(&mut snapshot_contents).unwrap();
+        let ro_mem = ReadonlySharedMemory::from_bytes(&snapshot_contents).unwrap();
 
         let scratch_mem = ExclusiveSharedMemory::new(config.get_scratch_size()).unwrap();
-        let mut mem_mgr = SandboxMemoryManager::new(
+        let mem_mgr = SandboxMemoryManager::new(
             layout,
-            eshm,
+            ro_mem.to_mgr_snapshot_mem().unwrap(),
             scratch_mem,
             NextAction::Initialise(layout.get_guest_code_address() as u64),
         );
-        mem_mgr.write_memory_layout().unwrap();
 
         let (mut hshm, gshm) = mem_mgr.build().unwrap();
 

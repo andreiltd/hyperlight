@@ -114,6 +114,7 @@ pub(super) fn evolve_impl_multi_use(u_sbox: UninitializedSandbox) -> Result<Mult
         // it — acceptable since we're about to return Err and the
         // VM will be dropped. The limit was already validated in
         // UninitializedSandbox::map_file_cow.
+        #[cfg(feature = "nanvix-unstable")]
         hshm.write_file_mapping_entry(prepared.guest_base, prepared.size as u64, &prepared.label)?;
         hshm.mapped_rgns += 1;
     }
@@ -162,7 +163,7 @@ pub(crate) fn set_up_hypervisor_partition(
         match gdb_conn {
             Ok(gdb_conn) => Some(gdb_conn),
             Err(e) => {
-                log::error!("Could not create gdb connection: {:#}", e);
+                tracing::error!("Could not create gdb connection: {:#}", e);
 
                 None
             }

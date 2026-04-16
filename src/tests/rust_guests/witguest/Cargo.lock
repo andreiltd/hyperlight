@@ -13,9 +13,9 @@ dependencies = [
 
 [[package]]
 name = "anstream"
-version = "0.6.21"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43d5b281e737544384e969a5ccad3f1cdd24b48086a0fc1b2a5262a26b8f4f4a"
+checksum = "824a212faf96e9acacdbd09febd34438f8f711fb84e09a8916013cd7815ca28d"
 dependencies = [
  "anstyle",
  "anstyle-parse",
@@ -34,9 +34,9 @@ checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
 name = "anstyle-parse"
-version = "0.2.7"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e7644824f0aa2c7b9384579234ef10eb7efb6a0deb83f9630a49594dd9c15c2"
+checksum = "52ce7f38b242319f7cabaa6813055467063ecdc9d355bbb4ce0c68908cd8130e"
 dependencies = [
  "utf8parse",
 ]
@@ -75,9 +75,9 @@ checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
 name = "buddy_system_allocator"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b672b945a3e4f4f40bfd4cd5ee07df9e796a42254ce7cd6d2599ad969244c44a"
+checksum = "c1af5a01adeeade54c9f5060300227a8ee64c05b6376f28e9b8ee3b72dd2056f"
 dependencies = [
  "spin",
 ]
@@ -122,9 +122,9 @@ dependencies = [
 
 [[package]]
 name = "env_logger"
-version = "0.11.9"
+version = "0.11.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2daee4ea451f429a58296525ddf28b45a3b64f1acf6587e2067437bb11e218d"
+checksum = "0621c04f2196ac3f488dd583365b9c09be011a4ab8b9f37248ffcc8f6198b56a"
 dependencies = [
  "anstream",
  "anstyle",
@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlight-common"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "flatbuffers",
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlight-component-macro"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "env_logger",
  "hyperlight-component-util",
@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlight-component-util"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "itertools",
  "prettyplease",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlight-guest"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "flatbuffers",
@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlight-guest-bin"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "buddy_system_allocator",
@@ -251,7 +251,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlight-guest-macro"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlight-guest-tracing"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "hyperlight-common",
  "spin",
@@ -651,9 +651,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "wasmparser"
-version = "0.245.1"
+version = "0.246.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f08c9adee0428b7bddf3890fc27e015ac4b761cc608c822667102b8bfd6995e"
+checksum = "2d991c35d79bf8336dc1cd632ed4aacf0dc5fac4bc466c670625b037b972bb9c"
 dependencies = [
  "bitflags",
  "hashbrown",

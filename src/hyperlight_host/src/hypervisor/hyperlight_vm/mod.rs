@@ -47,7 +47,7 @@ use crate::hypervisor::virtual_machine::{
 };
 use crate::hypervisor::{InterruptHandle, InterruptHandleImpl};
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags, MemoryRegionType};
-use crate::mem::mgr::SandboxMemoryManager;
+use crate::mem::mgr::{SandboxMemoryManager, SnapshotSharedMemory};
 use crate::mem::shared_mem::{GuestSharedMemory, HostSharedMemory, SharedMemory};
 use crate::metrics::{METRIC_ERRONEOUS_VCPU_KICKS, METRIC_GUEST_CANCELLATION};
 use crate::sandbox::host_funcs::FunctionRegistry;
@@ -375,7 +375,7 @@ pub(crate) struct HyperlightVm {
     pub(super) snapshot_slot: u32,
     // The current snapshot region, used to keep it alive as long as
     // it is used & when unmapping
-    pub(super) snapshot_memory: Option<GuestSharedMemory>,
+    pub(super) snapshot_memory: Option<SnapshotSharedMemory<GuestSharedMemory>>,
     pub(super) scratch_slot: u32, // The slot number used for the scratch region
     // The current scratch region, used to keep it alive as long as it
     // is used & when unmapping
@@ -460,7 +460,7 @@ impl HyperlightVm {
     /// Update the snapshot mapping to point to a new GuestSharedMemory
     pub(crate) fn update_snapshot_mapping(
         &mut self,
-        snapshot: GuestSharedMemory,
+        snapshot: SnapshotSharedMemory<GuestSharedMemory>,
     ) -> Result<(), UpdateRegionError> {
         let guest_base = crate::mem::layout::SandboxMemoryLayout::BASE_ADDRESS as u64;
         let rgn = snapshot.mapping_at(guest_base, MemoryRegionType::Snapshot);

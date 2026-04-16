@@ -16,9 +16,9 @@ checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
 name = "buddy_system_allocator"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b672b945a3e4f4f40bfd4cd5ee07df9e796a42254ce7cd6d2599ad969244c44a"
+checksum = "c1af5a01adeeade54c9f5060300227a8ee64c05b6376f28e9b8ee3b72dd2056f"
 dependencies = [
  "spin",
 ]
@@ -75,7 +75,7 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
 name = "hyperlight-common"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "flatbuffers",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlight-guest"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "flatbuffers",
@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlight-guest-bin"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "buddy_system_allocator",
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlight-guest-macro"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlight-guest-tracing"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "hyperlight-common",
  "spin",
