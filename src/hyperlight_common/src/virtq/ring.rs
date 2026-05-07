@@ -74,6 +74,7 @@ limitations under the License.
 //! - **DESC**: Notify only when a specific descriptor index is reached
 //! ```
 
+use core::fmt;
 use core::marker::PhantomData;
 use core::sync::atomic::{Ordering, fence};
 
@@ -128,6 +129,30 @@ pub struct SubmitResult {
     pub notify: bool,
 }
 
+/// Memory operation that failed in the backend.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum MemOp {
+    /// Reading a descriptor from the descriptor table.
+    ReadDesc,
+    /// Writing a descriptor to the descriptor table.
+    WriteDesc,
+    /// Reading an event suppression structure.
+    ReadEvent,
+    /// Writing an event suppression structure.
+    WriteEvent,
+}
+
+impl fmt::Display for MemOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReadDesc => f.write_str("reading descriptor"),
+            Self::WriteDesc => f.write_str("writing descriptor"),
+            Self::ReadEvent => f.write_str("reading event suppression"),
+            Self::WriteEvent => f.write_str("writing event suppression"),
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum RingError {
     #[error("Buffer chain is empty")]
@@ -142,8 +167,27 @@ pub enum RingError {
     InvalidState,
     #[error("Invalid memory layout")]
     InvalidLayout,
-    #[error("Backend memory error")]
-    MemError,
+    #[error("Backend memory error while {op} at address 0x{addr:x}, len {len}")]
+    MemError {
+        /// Memory operation that failed.
+        op: MemOp,
+        /// Address passed to the memory backend.
+        addr: u64,
+        /// Number of bytes requested for the operation.
+        len: usize,
+    },
+}
+
+impl RingError {
+    #[inline]
+    fn mem_err(op: MemOp, addr: u64) -> Self {
+        let len = match op {
+            MemOp::ReadDesc | MemOp::WriteDesc => Descriptor::SIZE,
+            MemOp::ReadEvent | MemOp::WriteEvent => EventSuppression::SIZE,
+        };
+
+        Self::MemError { op, addr, len }
+    }
 }
 
 /// Type-state: Can add readable buffers
@@ -510,7 +554,7 @@ impl<M: MemOps> RingProducer<M> {
 
         // Release publish
         desc.write_release(&self.mem, addr)
-            .map_err(|_| RingError::MemError)?;
+            .map_err(|_| RingError::mem_err(MemOp::WriteDesc, addr))?;
 
         // Advance state
         self.avail_cursor.advance();
@@ -617,7 +661,7 @@ impl<M: MemOps> RingProducer<M> {
 
             self.mem
                 .write_val(addr, desc)
-                .map_err(|_| RingError::MemError)?;
+                .map_err(|_| RingError::mem_err(MemOp::WriteDesc, addr))?;
             pos.advance();
         }
 
@@ -639,7 +683,7 @@ impl<M: MemOps> RingProducer<M> {
         // Release publish
         head_desc
             .write_release(&self.mem, head_addr)
-            .map_err(|_| RingError::MemError)?;
+            .map_err(|_| RingError::mem_err(MemOp::WriteDesc, head_addr))?;
 
         self.num_free -= total_descs;
         self.avail_cursor = pos;
@@ -667,7 +711,8 @@ impl<M: MemOps> RingProducer<M> {
             .ok_or(RingError::InvalidState)?;
 
         // Acquire flags then fields (publish point)
-        let desc = Descriptor::read_acquire(&self.mem, addr).map_err(|_| RingError::MemError)?;
+        let desc = Descriptor::read_acquire(&self.mem, addr)
+            .map_err(|_| RingError::mem_err(MemOp::ReadDesc, addr))?;
         if !desc.is_used(wrap) {
             return Err(RingError::WouldBlock);
         }
@@ -769,12 +814,12 @@ impl<M: MemOps> RingProducer<M> {
         let mut evt = self
             .mem
             .read_val::<EventSuppression>(self.drv_evt_addr)
-            .map_err(|_| RingError::MemError)?;
+            .map_err(|_| RingError::mem_err(MemOp::ReadEvent, self.drv_evt_addr))?;
 
         evt.set_flags(EventFlags::DISABLE);
 
         evt.write_release(&self.mem, self.drv_evt_addr)
-            .map_err(|_| RingError::MemError)?;
+            .map_err(|_| RingError::mem_err(MemOp::WriteEvent, self.drv_evt_addr))?;
         self.event_flags_shadow = EventFlags::DISABLE;
         Ok(())
     }
@@ -788,11 +833,11 @@ impl<M: MemOps> RingProducer<M> {
         let mut evt = self
             .mem
             .read_val::<EventSuppression>(self.drv_evt_addr)
-            .map_err(|_| RingError::MemError)?;
+            .map_err(|_| RingError::mem_err(MemOp::ReadEvent, self.drv_evt_addr))?;
 
         evt.set_flags(EventFlags::ENABLE);
         evt.write_release(&self.mem, self.drv_evt_addr)
-            .map_err(|_| RingError::MemError)?;
+            .map_err(|_| RingError::mem_err(MemOp::WriteEvent, self.drv_evt_addr))?;
 
         self.event_flags_shadow = EventFlags::ENABLE;
         Ok(())
@@ -812,14 +857,14 @@ impl<M: MemOps> RingProducer<M> {
         let mut evt = self
             .mem
             .read_val::<EventSuppression>(self.drv_evt_addr)
-            .map_err(|_| RingError::MemError)?;
+            .map_err(|_| RingError::mem_err(MemOp::ReadEvent, self.drv_evt_addr))?;
 
         evt.set_desc_event(off, wrap);
         evt.set_flags(EventFlags::DESC);
 
         // Now publish flags = DESC with Release semantics.
         evt.write_release(&self.mem, self.drv_evt_addr)
-            .map_err(|_| RingError::MemError)?;
+            .map_err(|_| RingError::mem_err(MemOp::WriteEvent, self.drv_evt_addr))?;
         // cache shadow
         self.event_flags_shadow = EventFlags::DESC;
         Ok(())
@@ -847,7 +892,7 @@ impl<M: MemOps> RingProducer<M> {
         fence(Ordering::SeqCst);
 
         let evt = EventSuppression::read_acquire(&self.mem, self.dev_evt_addr)
-            .map_err(|_| RingError::MemError)?;
+            .map_err(|_| RingError::mem_err(MemOp::ReadEvent, self.dev_evt_addr))?;
 
         Ok(should_notify(evt, self.len() as u16, old, new))
     }
@@ -975,8 +1020,8 @@ impl<M: MemOps> RingConsumer<M> {
             .ok_or(RingError::InvalidState)?;
 
         // Acquire: flags then fields (publish point)
-        let head_desc =
-            Descriptor::read_acquire(&self.mem, head_addr).map_err(|_| RingError::MemError)?;
+        let head_desc = Descriptor::read_acquire(&self.mem, head_addr)
+            .map_err(|_| RingError::mem_err(MemOp::ReadDesc, head_addr))?;
 
         // Check if head descriptor is available to consume
         if !head_desc.is_avail(wrap) {
@@ -1006,7 +1051,10 @@ impl<M: MemOps> RingConsumer<M> {
                 .ok_or(RingError::InvalidState)?;
 
             // tail reads does not need ordering because head has been already validated
-            let desc: Descriptor = self.mem.read_val(addr).map_err(|_| RingError::MemError)?;
+            let desc: Descriptor = self
+                .mem
+                .read_val(addr)
+                .map_err(|_| RingError::mem_err(MemOp::ReadDesc, addr))?;
             let elem = BufferElement::from(&desc);
 
             if elem.writable {
@@ -1097,7 +1145,7 @@ impl<M: MemOps> RingConsumer<M> {
         // Release publish (flags written last inside write_release)
         used_desc
             .write_release(&self.mem, addr)
-            .map_err(|_| RingError::MemError)?;
+            .map_err(|_| RingError::mem_err(MemOp::WriteDesc, addr))?;
 
         // Advance used cursor by whole chain length
         self.used_cursor.advance_by(chain_len);
@@ -1115,7 +1163,8 @@ impl<M: MemOps> RingConsumer<M> {
             return Err(RingError::InvalidState);
         };
 
-        let desc = Descriptor::read_acquire(&self.mem, addr).map_err(|_| RingError::MemError)?;
+        let desc = Descriptor::read_acquire(&self.mem, addr)
+            .map_err(|_| RingError::mem_err(MemOp::ReadDesc, addr))?;
         Ok(desc.is_avail(self.avail_cursor.wrap()))
     }
 
@@ -1180,11 +1229,11 @@ impl<M: MemOps> RingConsumer<M> {
         let mut evt = self
             .mem
             .read_val::<EventSuppression>(self.dev_evt_addr)
-            .map_err(|_| RingError::MemError)?;
+            .map_err(|_| RingError::mem_err(MemOp::ReadEvent, self.dev_evt_addr))?;
 
         evt.set_flags(EventFlags::DISABLE);
         evt.write_release(&self.mem, self.dev_evt_addr)
-            .map_err(|_| RingError::MemError)?;
+            .map_err(|_| RingError::mem_err(MemOp::WriteEvent, self.dev_evt_addr))?;
 
         self.event_flags_shadow = EventFlags::DISABLE;
         Ok(())
@@ -1199,11 +1248,11 @@ impl<M: MemOps> RingConsumer<M> {
         let mut evt = self
             .mem
             .read_val::<EventSuppression>(self.dev_evt_addr)
-            .map_err(|_| RingError::MemError)?;
+            .map_err(|_| RingError::mem_err(MemOp::ReadEvent, self.dev_evt_addr))?;
 
         evt.set_flags(EventFlags::ENABLE);
         evt.write_release(&self.mem, self.dev_evt_addr)
-            .map_err(|_| RingError::MemError)?;
+            .map_err(|_| RingError::mem_err(MemOp::WriteEvent, self.dev_evt_addr))?;
 
         self.event_flags_shadow = EventFlags::ENABLE;
         Ok(())
@@ -1221,14 +1270,14 @@ impl<M: MemOps> RingConsumer<M> {
         let mut evt = self
             .mem
             .read_val::<EventSuppression>(self.dev_evt_addr)
-            .map_err(|_| RingError::MemError)?;
+            .map_err(|_| RingError::mem_err(MemOp::ReadEvent, self.dev_evt_addr))?;
 
         evt.set_desc_event(off, wrap);
         evt.set_flags(EventFlags::DESC);
 
         // Now publish flags = DESC with Release semantics.
         evt.write_release(&self.mem, self.dev_evt_addr)
-            .map_err(|_| RingError::MemError)?;
+            .map_err(|_| RingError::mem_err(MemOp::WriteEvent, self.dev_evt_addr))?;
 
         self.event_flags_shadow = EventFlags::DESC;
         Ok(())
@@ -1249,7 +1298,7 @@ impl<M: MemOps> RingConsumer<M> {
         fence(Ordering::SeqCst);
 
         let evt = EventSuppression::read_acquire(&self.mem, self.drv_evt_addr)
-            .map_err(|_| RingError::MemError)?;
+            .map_err(|_| RingError::mem_err(MemOp::ReadEvent, self.drv_evt_addr))?;
 
         Ok(should_notify(evt, self.desc_table.len() as u16, old, new))
     }
