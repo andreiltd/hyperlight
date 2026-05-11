@@ -396,6 +396,7 @@ impl RingCursor {
     /// Advance to next position, wrapping around and toggling wrap counter if needed
     #[inline]
     fn advance(&mut self) {
+        debug_assert!(self.head.checked_add(1).is_some());
         self.head += 1;
         if self.head >= self.size {
             self.head = 0;
@@ -406,6 +407,7 @@ impl RingCursor {
     /// Advance by n positions using modular arithmetic.
     #[inline]
     fn advance_by(&mut self, n: u16) {
+        debug_assert!(self.head.checked_add(n).is_some());
         let new = self.head + n;
         let wraps = new / self.size;
         self.head = new % self.size;
@@ -1078,6 +1080,12 @@ impl<M: MemOps> RingConsumer<M> {
             return Err(RingError::BadChain);
         }
 
+        // Check if next inflight will exceed ring capacity - this should never happen if driver is
+        // well-behaved and we correctly track inflight count.
+        if self.num_inflight + chain_len as usize > self.desc_table.len() {
+            return Err(RingError::InvalidState);
+        }
+
         let readables = elements.len() - writables;
 
         // Since driver wrote the same id everywhere, head_desc.id is valid.
@@ -1096,8 +1104,6 @@ impl<M: MemOps> RingConsumer<M> {
         self.avail_cursor = pos;
         // Update inflight count
         self.num_inflight += chain_len as usize;
-
-        debug_assert!(self.num_inflight <= self.desc_table.len());
 
         Ok((
             id,
@@ -1126,7 +1132,7 @@ impl<M: MemOps> RingConsumer<M> {
             .get(id as usize)
             .ok_or(RingError::InvalidState)?;
 
-        if chain_len == 0 {
+        if chain_len == 0 || chain_len > self.desc_table.len() as u16 {
             return Err(RingError::InvalidState);
         }
 
@@ -1152,8 +1158,6 @@ impl<M: MemOps> RingConsumer<M> {
         self.id_num[id as usize] = 0;
 
         self.num_inflight -= chain_len as usize;
-        debug_assert!(self.num_inflight <= self.desc_table.len());
-
         Ok(())
     }
 
