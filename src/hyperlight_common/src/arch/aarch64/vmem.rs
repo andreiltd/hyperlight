@@ -64,7 +64,7 @@ pub unsafe fn walk_va_spaces<Op: TableReadOps>(
 /// is [`crate::vmem::Void`] making the `AnotherSpace` match arm statically unreachable.
 pub type SpaceReferenceMapping = crate::vmem::Void;
 
-/// Statically unreachable: amd64 never emits `AnotherSpace`.
+/// Statically unreachable: aarch64 never emits `AnotherSpace`.
 #[allow(clippy::missing_safety_doc)]
 pub(super) unsafe fn link_shared_table<Op: TableOps>(
     _op: &Op,

@@ -412,7 +412,7 @@ pub unsafe fn walk_va_spaces<Op: TableReadOps>(
     out
 }
 
-/// aarch64 never emits `AnotherSpace` entries, so [`SpaceReferenceMapping`]
+/// amd64 never emits `AnotherSpace` entries, so [`SpaceReferenceMapping`]
 /// is [`crate::vmem::Void`] making the `AnotherSpace` match arm statically unreachable.
 pub type SpaceReferenceMapping = crate::vmem::Void;
 
