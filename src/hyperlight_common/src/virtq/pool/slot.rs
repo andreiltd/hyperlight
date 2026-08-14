@@ -187,6 +187,17 @@ impl Tier {
         );
     }
 
+    fn for_each_free(&self, visit: &mut impl FnMut(Allocation)) {
+        for index in 0..self.count {
+            if !self.allocated.contains(index) {
+                visit(Allocation {
+                    addr: self.base_addr + (index * self.slot_size as usize) as u64,
+                    len: self.slot_size,
+                });
+            }
+        }
+    }
+
     fn layout(&self) -> SlotLayout {
         SlotLayout::new(self.base_addr, self.slot_size as usize, self.count)
     }
@@ -405,6 +416,13 @@ impl Inner {
     fn layouts(&self) -> (Option<SlotLayout>, SlotLayout) {
         (self.lower.as_ref().map(Tier::layout), self.upper.layout())
     }
+
+    fn for_each_free(&self, mut visit: impl FnMut(Allocation)) {
+        if let Some(lower) = &self.lower {
+            lower.for_each_free(&mut visit);
+        }
+        self.upper.for_each_free(&mut visit);
+    }
 }
 
 /// A buffer pool with one or two fixed-slot tiers.
@@ -465,6 +483,11 @@ impl SlotPool {
     /// Total number of currently allocated slots across all tiers.
     pub fn num_live(&self) -> usize {
         self.inner.borrow().num_live()
+    }
+
+    /// Visit every free slot in deterministic tier and index order.
+    pub fn for_each_free(&self, visit: impl FnMut(Allocation)) {
+        self.inner.borrow().for_each_free(visit);
     }
 
     /// Total number of free slots in the lower tier.

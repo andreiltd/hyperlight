@@ -3,9 +3,9 @@
 
 //! Host virtqueue construction and canonical snapshot validation.
 //!
-//! Runtime consumers bind bounded ring and pool views to the host-owned fixed
-//! transport arena. They start at cursor zero before the first guest entry and
-//! observe descriptors published by the guest later.
+//! Runtime consumers bind bounded ring views to the host-owned fixed transport
+//! arena and payload views to dynamic scratch. They start at cursor zero before
+//! the first guest entry and observe descriptors published by the guest later.
 //!
 //! H2G requests are written into guest-prefilled chains. G2H codec helpers copy
 //! untrusted guest requests and results into host-owned values before use.
@@ -26,7 +26,7 @@ pub(crate) use codec::{
     read_message_header, try_write_response,
 };
 use hyperlight_common::layout::{QueueDims, TransportArena};
-use hyperlight_common::virtq::canonical::validate_canon_image;
+use hyperlight_common::virtq::canonical::{validate_canon_image, validate_canon_prefix};
 use hyperlight_common::virtq::{
     Layout as VirtqLayout, MemOps, Notifier, QueueStats, VirtqConsumer,
 };
@@ -66,28 +66,7 @@ pub(crate) fn create_consumers(
     build_consumers(scratch_mem, regions, g2h_layout, h2g_layout)
 }
 
-/// Validate a materialized canonical image before attaching consumers.
-fn attach_canonical(
-    layout: &SandboxMemoryLayout,
-    scratch_mem: &HostSharedMemory,
-) -> Result<(G2hConsumer, H2gConsumer)> {
-    let validator = Validator::new(layout)?;
-    let arena_gpa = read_published_arena_gpa(scratch_mem)?;
-    let regions = validator.validate_published_arena(arena_gpa)?;
-
-    let g2h_ring_mem = HostMemOps::new(scratch_mem, regions.g2h_ring.clone())?;
-    let g2h_layout = validator.validate_g2h(&g2h_ring_mem, regions.g2h_ring.clone())?;
-
-    let h2g_ring_mem = HostMemOps::new(scratch_mem, regions.h2g_ring.clone())?;
-    // Why Range is not Copy?
-    let h2g_ring = regions.h2g_ring.clone();
-    let h2g_pool = regions.h2g_pool.clone();
-    let h2g_layout = validator.validate_h2g(&h2g_ring_mem, h2g_ring, h2g_pool)?;
-
-    build_consumers(scratch_mem, regions, g2h_layout, h2g_layout)
-}
-
-/// Bind consumers to separately bounded ring and pool mappings.
+/// Bind consumers to separately bounded ring and payload mappings.
 fn build_consumers(
     scratch_mem: &HostSharedMemory,
     regions: GvaRegions,
@@ -95,9 +74,9 @@ fn build_consumers(
     h2g_layout: VirtqLayout,
 ) -> Result<(G2hConsumer, H2gConsumer)> {
     let g2h_ring_mem = HostMemOps::new(scratch_mem, regions.g2h_ring)?;
-    let g2h_pool_mem = HostMemOps::new(scratch_mem, regions.g2h_pool)?;
+    let g2h_pool_mem = HostMemOps::new(scratch_mem, regions.payload.clone())?;
     let h2g_ring_mem = HostMemOps::new(scratch_mem, regions.h2g_ring)?;
-    let h2g_pool_mem = HostMemOps::new(scratch_mem, regions.h2g_pool)?;
+    let h2g_pool_mem = HostMemOps::new(scratch_mem, regions.payload)?;
 
     Ok((
         VirtqConsumer::new_split(g2h_layout, g2h_ring_mem, g2h_pool_mem, HostNotifier),
@@ -107,7 +86,7 @@ fn build_consumers(
 
 /// Capture the canonical ring state omitted from the main memory snapshot.
 ///
-/// Pool contents are transient and are not included.
+/// Retained pool pages are captured through ordinary stable guest mappings.
 pub(crate) fn snapshot(
     layout: &SandboxMemoryLayout,
     scratch_mem: &HostSharedMemory,
@@ -121,7 +100,7 @@ pub(crate) fn snapshot(
     validator.validate_g2h(&g2h_mem, regions.g2h_ring.clone())?;
 
     let h2g_mem = HostMemOps::new(scratch_mem, regions.h2g_ring.clone())?;
-    validator.validate_h2g(&h2g_mem, regions.h2g_ring.clone(), regions.h2g_pool.clone())?;
+    validator.validate_h2g(&h2g_mem, regions.h2g_ring.clone(), regions.payload.clone())?;
 
     // The vCPU is stopped, so the ring images and snapshotted guest producer
     // bookkeeping describe the same instant.
@@ -146,7 +125,7 @@ pub(crate) fn restore(
     write_published_arena_gpa(scratch_mem, layout.get_transport_arena().base_addr())?;
     write_ring(scratch_mem, regions.g2h_ring, &snapshot.g2h_ring)?;
     write_ring(scratch_mem, regions.h2g_ring, &snapshot.h2g_ring)?;
-    attach_canonical(layout, scratch_mem)
+    create_consumers(layout, scratch_mem)
 }
 
 /// Bounded GVA regions derived from validated transport GPAs.
@@ -155,10 +134,8 @@ struct GvaRegions {
     g2h_ring: Range<u64>,
     /// Host-to-guest packed ring image.
     h2g_ring: Range<u64>,
-    /// Guest-to-host descriptor buffer pool.
-    g2h_pool: Range<u64>,
-    /// Host-to-guest descriptor buffer pool.
-    h2g_pool: Range<u64>,
+    /// Dynamic scratch range available for descriptor buffers.
+    payload: Range<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -283,12 +260,12 @@ impl<'a> Validator<'a> {
     /// Validate a canonical H2G image and return its layout.
     ///
     /// Each available chain contains one writable descriptor. Descriptors must
-    /// name distinct, slot-aligned ranges inside the H2G pool.
+    /// name distinct ranges inside dynamic scratch.
     fn validate_h2g<M: MemOps>(
         &self,
         mem: &M,
         ring: Range<u64>,
-        pool: Range<u64>,
+        payload: Range<u64>,
     ) -> Result<VirtqLayout> {
         let layout = self.config.h2g.layout(&ring)?;
         let bufsz = self.config.h2g.buffer_size;
@@ -301,25 +278,18 @@ impl<'a> Validator<'a> {
         // Record the accepted descriptor ranges to detect overlaps.
         let mut accepted: Vec<Range<u64>> = Vec::with_capacity(prefill);
 
-        let image = validate_canon_image(mem, layout, prefill, |_, elem| {
-            let Ok(bufsz_u64) = u64::try_from(bufsz) else {
-                return false;
-            };
-
+        let image = validate_canon_prefix(mem, layout, prefill, |_, elem| {
             // all descriptors must be writable and match the configured buffer size
             if !elem.writable || usize::try_from(elem.len).ok() != Some(bufsz) {
                 return false;
             }
 
-            let Some(offset) = elem.addr.checked_sub(pool.start) else {
-                return false;
-            };
             let Some(end) = elem.addr.checked_add(u64::from(elem.len)) else {
                 return false;
             };
 
-            // all descriptors must be slot-aligned and remain inside the pool
-            if !offset.is_multiple_of(bufsz_u64) || end > pool.end {
+            // all descriptors must remain inside dynamic scratch
+            if elem.addr < payload.start || end > payload.end {
                 return false;
             }
 
@@ -338,7 +308,7 @@ impl<'a> Validator<'a> {
         })
         .map_err(|error| new_error!("invalid canonical H2G image: {error}"))?;
 
-        if image.len() != prefill || image.iter().any(|chain| chain.buffers().len() != 1) {
+        if image.is_empty() || image.iter().any(|chain| chain.buffers().len() != 1) {
             return Err(new_error!("invalid initial H2G receive buffers"));
         }
 
@@ -371,9 +341,28 @@ impl<'a> Validator<'a> {
         self.validate_g2h(&g2h_mem, regions.g2h_ring.clone())?;
 
         let h2g_mem = ImageMem::new(regions.h2g_ring.start, &snapshot.h2g_ring);
-        self.validate_h2g(&h2g_mem, regions.h2g_ring.clone(), regions.h2g_pool.clone())?;
+        self.validate_h2g(
+            &h2g_mem,
+            regions.h2g_ring.clone(),
+            self.snapshot_payload_region()?,
+        )?;
 
         Ok(regions)
+    }
+
+    fn snapshot_payload_region(&self) -> Result<Range<u64>> {
+        let scratch_base_gpa =
+            hyperlight_common::layout::scratch_base_gpa(self.layout.get_scratch_size());
+        let scratch_base_gva =
+            hyperlight_common::layout::scratch_base_gva(self.layout.get_scratch_size());
+        let to_gva = |gpa: u64| {
+            gpa.checked_sub(scratch_base_gpa)
+                .and_then(|offset| scratch_base_gva.checked_add(offset))
+                .ok_or_else(|| new_error!("scratch GPA {gpa:#x} to GVA translation overflow"))
+        };
+
+        Ok(to_gva(self.config.arena.end_addr())?
+            ..to_gva(hyperlight_common::layout::scratch_allocator_limit_gpa())?)
     }
 
     /// Translate validated transport GPAs into the GVA ranges used by descriptors.
@@ -393,31 +382,30 @@ impl<'a> Validator<'a> {
                 .ok_or_else(|| new_error!("GPA {gpa:#x} to GVA translation overflow"))
         };
 
-        let (
-            g2h_ring_addr,
-            h2g_ring_addr,
-            g2h_pool_addr,
-            h2g_pool_addr,
-            g2h_ring_len,
-            h2g_ring_len,
-            g2h_pool_len,
-            h2g_pool_len,
-        ) = (
+        let (g2h_ring_addr, h2g_ring_addr, g2h_ring_len, h2g_ring_len) = (
             self.config.arena.g2h_ring_addr(),
             self.config.arena.h2g_ring_addr(),
-            self.config.arena.g2h_pool_addr(),
-            self.config.arena.h2g_pool_addr(),
             self.config.g2h.dims.ring_len(),
             self.config.h2g.dims.ring_len(),
-            self.config.g2h.dims.pool_len(),
-            self.config.h2g.dims.pool_len(),
         );
+
+        let scratch_base_gpa =
+            hyperlight_common::layout::scratch_base_gpa(self.layout.get_scratch_size());
+        let scratch_base_gva =
+            hyperlight_common::layout::scratch_base_gva(self.layout.get_scratch_size());
+        let to_scratch_gva = |gpa: u64| {
+            gpa.checked_sub(scratch_base_gpa)
+                .and_then(|offset| scratch_base_gva.checked_add(offset))
+                .ok_or_else(|| new_error!("scratch GPA {gpa:#x} to GVA translation overflow"))
+        };
+
+        let payload = to_scratch_gva(self.layout.get_first_free_scratch_gpa())?
+            ..to_scratch_gva(hyperlight_common::layout::scratch_allocator_limit_gpa())?;
 
         Ok(GvaRegions {
             g2h_ring: checked_region(to_gva(g2h_ring_addr)?, g2h_ring_len, "G2H ring")?,
             h2g_ring: checked_region(to_gva(h2g_ring_addr)?, h2g_ring_len, "H2G ring")?,
-            g2h_pool: checked_region(to_gva(g2h_pool_addr)?, g2h_pool_len, "G2H pool")?,
-            h2g_pool: checked_region(to_gva(h2g_pool_addr)?, h2g_pool_len, "H2G pool")?,
+            payload,
         })
     }
 }

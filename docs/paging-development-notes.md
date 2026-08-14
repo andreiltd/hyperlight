@@ -140,9 +140,13 @@ snapshotting. This is not enforced, but odd things may happen if it is
 violated.
 
 Host and guest calls use two virtqueues in a fixed transport arena at
-the bottom of scratch. The arena contains both rings and their
-fixed-slot buffer pools. Copied page tables follow the arena. Dynamic
-scratch allocations begin after the copied page tables.
+the bottom of scratch. The arena contains both rings and the checkpoint
+mailbox. Copied page tables follow the arena. The guest allocates each
+fixed-slot buffer pool from dynamic scratch.
+
+Retained transport buffers use stable aliases outside the scratch GVA range.
+Snapshot compaction preserves those mappings and copies their sanitized
+physical pages into the snapshot.
 
 The minimum scratch size is calculated by `min_scratch_size()` in the
 architecture-specific layout modules under `hyperlight_common`; see

@@ -17,6 +17,24 @@ use crate::sandbox::SandboxConfiguration;
 pub(crate) const SCRATCH_SIZE: usize = 0x20_000;
 pub(crate) const H2G_BUFFER_SIZE: usize = 3000;
 
+fn attach_canonical(
+    layout: &SandboxMemoryLayout,
+    scratch: &HostSharedMemory,
+) -> Result<(G2hConsumer, H2gConsumer)> {
+    let validator = Validator::new(layout)?;
+    let arena_gpa = read_published_arena_gpa(scratch)?;
+    let regions = validator.validate_published_arena(arena_gpa)?;
+
+    let g2h_mem = HostMemOps::new(scratch, regions.g2h_ring.clone())?;
+    let g2h_layout = validator.validate_g2h(&g2h_mem, regions.g2h_ring.clone())?;
+
+    let h2g_mem = HostMemOps::new(scratch, regions.h2g_ring.clone())?;
+    let h2g_layout =
+        validator.validate_h2g(&h2g_mem, regions.h2g_ring.clone(), regions.payload.clone())?;
+
+    build_consumers(scratch, regions, g2h_layout, h2g_layout)
+}
+
 pub(crate) struct TestVirtq {
     pub(crate) scratch: HostSharedMemory,
     pub(crate) g2h_mem: HostMemOps,
@@ -25,6 +43,7 @@ pub(crate) struct TestVirtq {
     pub(crate) h2g_ring: Range<u64>,
     pub(crate) g2h_pool: Range<u64>,
     pub(crate) h2g_pool: Range<u64>,
+    pub(crate) payload: Range<u64>,
     pub(crate) g2h_layout: VirtqLayout,
     pub(crate) h2g_layout: VirtqLayout,
 }
@@ -40,12 +59,16 @@ impl TestVirtq {
 
         let g2h_layout = config.g2h.layout(&regions.g2h_ring).unwrap();
         let h2g_layout = config.h2g.layout(&regions.h2g_ring).unwrap();
-        let arena = regions.g2h_ring.start..regions.h2g_pool.end;
+        let g2h_pool =
+            regions.payload.start..regions.payload.start + config.g2h.dims.pool_len() as u64;
+        let h2g_pool_range = g2h_pool.end..g2h_pool.end + config.h2g.dims.pool_len() as u64;
+        assert!(h2g_pool_range.end <= regions.payload.end);
+        let arena = regions.g2h_ring.start..h2g_pool_range.end;
 
         let mem = HostMemOps::new(&scratch, arena).unwrap();
 
         let h2g_pool = SlotPool::new(SlotLayout::new(
-            regions.h2g_pool.start,
+            h2g_pool_range.start,
             config.h2g.buffer_size,
             config.h2g_prefill_descs,
         ))
@@ -73,8 +96,9 @@ impl TestVirtq {
             scratch,
             g2h_ring: regions.g2h_ring,
             h2g_ring: regions.h2g_ring,
-            g2h_pool: regions.g2h_pool,
-            h2g_pool: regions.h2g_pool,
+            g2h_pool,
+            h2g_pool: h2g_pool_range,
+            payload: regions.payload,
             g2h_layout,
             h2g_layout,
         }
@@ -92,7 +116,7 @@ impl TestVirtq {
         let layout = memory_layout();
         let validator = Validator::new(&layout)?;
         validator.validate_g2h(&self.g2h_mem, self.g2h_ring.clone())?;
-        validator.validate_h2g(&self.h2g_mem, self.h2g_ring.clone(), self.h2g_pool.clone())?;
+        validator.validate_h2g(&self.h2g_mem, self.h2g_ring.clone(), self.payload.clone())?;
         Ok(())
     }
 
@@ -165,13 +189,9 @@ fn validates_host_placed_regions() {
         regions.h2g_ring.end - regions.h2g_ring.start,
         config.h2g.dims.ring_len() as u64
     );
-    assert_eq!(
-        regions.g2h_pool.end - regions.g2h_pool.start,
-        config.g2h.dims.pool_len() as u64
-    );
-    assert_eq!(
-        regions.h2g_pool.end - regions.h2g_pool.start,
-        config.h2g.dims.pool_len() as u64
+    assert!(
+        regions.payload.end - regions.payload.start
+            >= (config.g2h.dims.pool_len() + config.h2g.dims.pool_len()) as u64
     );
 }
 
@@ -265,26 +285,24 @@ fn rejects_nonzero_g2h_descriptors() {
 fn rejects_invalid_h2g_descriptors() {
     #[derive(Debug)]
     enum Corruption {
-        OutsidePool,
+        OutsideScratch,
         Readable,
         WrongSize,
-        Misaligned,
         Overlapping,
     }
 
     for corruption in [
-        Corruption::OutsidePool,
+        Corruption::OutsideScratch,
         Corruption::Readable,
         Corruption::WrongSize,
-        Corruption::Misaligned,
         Corruption::Overlapping,
     ] {
         let queue = TestVirtq::new();
         let mut desc = queue.h2g_desc(0);
 
         let index = match corruption {
-            Corruption::OutsidePool => {
-                desc.addr = queue.g2h_pool.start;
+            Corruption::OutsideScratch => {
+                desc.addr = queue.payload.end;
                 0
             }
             Corruption::Readable => {
@@ -293,10 +311,6 @@ fn rejects_invalid_h2g_descriptors() {
             }
             Corruption::WrongSize => {
                 desc.len -= 1;
-                0
-            }
-            Corruption::Misaligned => {
-                desc.addr += 1;
                 0
             }
             Corruption::Overlapping => {

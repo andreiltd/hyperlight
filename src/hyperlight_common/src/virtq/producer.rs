@@ -510,13 +510,11 @@ where
         written: usize,
     ) -> Result<Segments, VirtqError> {
         let mut owned = SmallVec::<[(BufferElement, usize); 4]>::new();
-        let mut free = SmallVec::<[BufferElement; 4]>::new();
         let mut remaining = written;
 
         for &alloc in writables {
             if remaining == 0 {
-                free.push(alloc);
-                continue;
+                break;
             }
 
             let len = remaining.min(alloc.len as usize);
@@ -525,21 +523,19 @@ where
         }
 
         if remaining != 0 {
-            let elems = owned.iter().map(|(elem, _)| *elem).chain(free);
-            self.retire_elems(elems)?;
+            self.retire_elems(writables.iter().copied())?;
             return Err(VirtqError::InvalidState);
         }
 
         for (elem, len) in &owned {
             if unsafe { self.inner.mem().as_slice(elem.addr, *len) }.is_err() {
-                let elems = owned.iter().map(|(elem, _)| *elem).chain(free);
-                let _ = self.retire_elems(elems);
+                let _ = self.retire_elems(writables.iter().copied());
                 return Err(VirtqError::MemoryReadError);
             }
         }
 
         let mut sgs = SmallVec::<[Bytes; 4]>::new();
-        for (elem, written) in owned {
+        for (index, (elem, written)) in owned.iter().copied().enumerate() {
             let alloc = OwnedAlloc::new(
                 self.pool.clone(),
                 Allocation {
@@ -548,15 +544,14 @@ where
                 },
             );
             let mem = self.inner.mem().clone();
-            let owner = BufferOwner {
-                alloc,
-                mem,
-                written,
+            let Ok(owner) = BufferOwner::new(mem, alloc, written) else {
+                let _ = self.retire_elems(writables[index + 1..].iter().copied());
+                return Err(VirtqError::MemoryReadError);
             };
             sgs.push(Bytes::from_owner(owner));
         }
 
-        self.retire_elems(free)?;
+        self.retire_elems(writables[owned.len()..].iter().copied())?;
 
         Ok(Segments::from_smallvec(sgs))
     }

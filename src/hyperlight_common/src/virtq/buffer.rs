@@ -204,9 +204,25 @@ impl Buf for SegmentsBuf<'_> {
 /// When dropped, the allocation is returned to the pool.
 #[derive(Debug)]
 pub struct BufferOwner<P: BufferProvider, M: MemOps> {
-    pub(crate) mem: M,
-    pub(crate) alloc: OwnedAlloc<P>,
-    pub(crate) written: usize,
+    mem: M,
+    alloc: OwnedAlloc<P>,
+    written: usize,
+    owner_addr: u64,
+}
+
+impl<P: BufferProvider, M: MemOps> BufferOwner<P, M> {
+    /// Creates an owner with a stable mapping for the initialized bytes.
+    pub(crate) fn new(mem: M, alloc: OwnedAlloc<P>, written: usize) -> Result<Self, M::Error> {
+        let allocation = alloc.allocation();
+        let owner_addr = mem.map_buf(allocation.addr, written, allocation.len as usize)?;
+
+        Ok(Self {
+            mem,
+            alloc,
+            written,
+            owner_addr,
+        })
+    }
 }
 
 impl<P: BufferProvider, M: MemOps> AsRef<[u8]> for BufferOwner<P, M> {
@@ -215,13 +231,15 @@ impl<P: BufferProvider, M: MemOps> AsRef<[u8]> for BufferOwner<P, M> {
         let len = self.written.min(alloc.len as usize);
         // Safety: BufferOwner keeps both the pool allocation and the M alive,
         // so the memory region is valid.
-        match unsafe { self.mem.as_slice(alloc.addr, len) } {
-            Ok(slice) => slice,
-            Err(_) => {
-                debug_assert!(false, "BufferOwner direct slice failed");
-                &[]
-            }
-        }
+        unsafe { self.mem.as_slice(self.owner_addr, len) }
+            .unwrap_or_else(|_| panic!("BufferOwner direct slice failed"))
+    }
+}
+
+impl<P: BufferProvider, M: MemOps> Drop for BufferOwner<P, M> {
+    fn drop(&mut self) {
+        let result = self.mem.unmap_buf(self.owner_addr, self.written);
+        assert!(result.is_ok(), "BufferOwner stable mapping release failed");
     }
 }
 

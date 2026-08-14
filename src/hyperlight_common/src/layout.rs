@@ -9,10 +9,11 @@ use core::num::{NonZeroU16, NonZeroUsize};
 mod arch;
 
 pub use arch::{
-    SCRATCH_TOP_GPA, SCRATCH_TOP_GVA, SNAPSHOT_PT_GVA_MAX, SNAPSHOT_PT_GVA_MIN, io_page,
+    SCRATCH_TOP_GPA, SCRATCH_TOP_GVA, SNAPSHOT_PT_GVA_MAX, SNAPSHOT_PT_GVA_MIN,
+    VIRTQ_BUFFER_GVA_MAX, VIRTQ_BUFFER_GVA_MIN, io_page,
 };
 
-use crate::virtq;
+use crate::{virtq, vmem};
 
 const EXN_STACK_ALIGNMENT: usize = 16;
 /// Pages reserved for the exception stack and scratch-top metadata.
@@ -99,7 +100,7 @@ const _: () = {
 
 /// Exclusive upper GPA boundary for dynamic scratch allocations.
 pub const fn scratch_allocator_limit_gpa() -> u64 {
-    (SCRATCH_TOP_GPA + 1 - SCRATCH_TOP_RESERVED_PAGES * crate::vmem::PAGE_SIZE) as u64
+    (SCRATCH_TOP_GPA + 1 - SCRATCH_TOP_RESERVED_PAGES * vmem::PAGE_SIZE) as u64
 }
 
 pub fn scratch_base_gpa(size: usize) -> u64 {
@@ -111,8 +112,9 @@ pub fn scratch_base_gva(size: usize) -> u64 {
 
 /// Compute the minimum scratch region size needed for a sandbox.
 ///
-/// The fixed transport prefix contains one page-backed ring arena and both
-/// page-backed buffer pools. The result saturates at [`usize::MAX`].
+/// The fixed transport prefix contains the page-backed ring arena. Guest
+/// allocations provide both buffer pools and stable-alias page tables. The
+/// result saturates at [`usize::MAX`].
 pub fn min_scratch_size(
     g2h_queue_size: usize,
     h2g_queue_size: usize,
@@ -124,10 +126,36 @@ pub fn min_scratch_size(
         let h2g = QueueDims::new(h2g_queue_size, h2g_pool_pages)?;
 
         let transport_len = TransportArena::checked_query_size(g2h, h2g)?;
-        fixed.checked_add(transport_len)
+        let pool_pages = g2h_pool_pages.checked_add(h2g_pool_pages)?;
+        let pool_len = pool_pages.checked_mul(vmem::PAGE_SIZE)?;
+        let alias_pt_len = virtq_alias_pt_pages(pool_pages)?.checked_mul(vmem::PAGE_SIZE)?;
+
+        fixed
+            .checked_add(transport_len)?
+            .checked_add(pool_len)?
+            .checked_add(alias_pt_len)
     });
 
     size.unwrap_or(usize::MAX)
+}
+
+fn virtq_alias_pt_pages(pool_pages: usize) -> Option<usize> {
+    const ENTRIES_PER_TABLE: usize = vmem::PAGE_TABLE_SIZE / size_of::<vmem::PageTableEntry>();
+    const MAX_SLOTS_PER_PAGE: usize = vmem::PAGE_SIZE / virtq::G2H_LOWER_SLOT_SIZE;
+
+    // A slot can cover its payload pages plus one boundary page so rounding each
+    // slot separately adds at most two pages.
+    let alias_pages = pool_pages.checked_mul(MAX_SLOTS_PER_PAGE.checked_mul(2)?.checked_add(1)?)?;
+    let mut covered_pages = alias_pages;
+    let mut table_pages = 0usize;
+
+    // Both supported architectures use three table levels below the root.
+    for _ in 0..3 {
+        covered_pages = covered_pages.checked_add(ENTRIES_PER_TABLE - 1)? / ENTRIES_PER_TABLE;
+        table_pages = table_pages.checked_add(covered_pages)?;
+    }
+
+    Some(table_pages)
 }
 
 /// Validated address independent dimensions for one transport queue.
@@ -148,7 +176,7 @@ impl QueueDims {
         }
 
         let pool_pages = NonZeroUsize::new(pool_pages)?;
-        pool_pages.get().checked_mul(crate::vmem::PAGE_SIZE)?;
+        pool_pages.get().checked_mul(vmem::PAGE_SIZE)?;
 
         virtq::Layout::checked_query_size(usize::from(size.get()))?;
 
@@ -172,19 +200,19 @@ impl QueueDims {
 
     /// Buffer pool length in bytes.
     pub const fn pool_len(&self) -> usize {
-        self.pool_pages.get() * crate::vmem::PAGE_SIZE
+        self.pool_pages.get() * vmem::PAGE_SIZE
     }
 }
 
-/// Addresses of both rings, the checkpoint mailbox, and pools in one fixed arena.
+/// Addresses of both rings and the checkpoint mailbox in one fixed arena.
 ///
 /// The G2H ring begins at the arena base. The H2G ring is descriptor aligned.
-/// The mailbox is `u64` aligned. Both pools are page aligned.
+/// The mailbox is `u64` aligned. The arena length is page aligned.
 ///
 /// ```text
-/// +----------+-----+----------+-----+-----+-----+----------+----------+
-/// | G2H ring | pad | H2G ring | pad | mbx | pad | G2H pool | H2G pool |
-/// +----------+-----+----------+-----+-----+-----+----------+----------+
+/// +----------+-----+----------+-----+-----+-----+
+/// | G2H ring | pad | H2G ring | pad | mbx | pad |
+/// +----------+-----+----------+-----+-----+-----+
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransportArena {
@@ -194,20 +222,14 @@ pub struct TransportArena {
     h2g_ring_addr: u64,
     /// Address of the snapshot checkpoint mailbox.
     mbx_addr: u64,
-    /// Address of the G2H pool.
-    g2h_pool_addr: u64,
-    /// Address of the H2G pool.
-    h2g_pool_addr: u64,
-    /// Page-aligned length occupied by both rings and the mailbox.
-    ring_span_len: usize,
-    /// Total page-aligned arena length.
+    /// Page-aligned arena length.
     len: usize,
 }
 
 impl TransportArena {
     /// Derive one transport arena from its base address and queue dimensions.
     pub fn new(base_addr: u64, g2h: QueueDims, h2g: QueueDims) -> Option<Self> {
-        if !base_addr.is_multiple_of(crate::vmem::PAGE_SIZE as u64) {
+        if !base_addr.is_multiple_of(vmem::PAGE_SIZE as u64) {
             return None;
         }
 
@@ -219,13 +241,9 @@ impl TransportArena {
             .checked_add(h2g.ring_len())?
             .checked_next_multiple_of(align_of::<u64>())?;
 
-        let g2h_pool_offset = mbx_offset
+        let len = mbx_offset
             .checked_add(size_of::<u64>())?
-            .checked_next_multiple_of(crate::vmem::PAGE_SIZE)?;
-
-        let h2g_pool_offset = g2h_pool_offset.checked_add(g2h.pool_len())?;
-
-        let len = h2g_pool_offset.checked_add(h2g.pool_len())?;
+            .checked_next_multiple_of(vmem::PAGE_SIZE)?;
 
         let addr = |offset: usize| base_addr.checked_add(u64::try_from(offset).ok()?);
         let _end_addr = addr(len)?;
@@ -234,9 +252,6 @@ impl TransportArena {
             g2h_ring_addr: base_addr,
             h2g_ring_addr: addr(h2g_ring_offset)?,
             mbx_addr: addr(mbx_offset)?,
-            g2h_pool_addr: addr(g2h_pool_offset)?,
-            h2g_pool_addr: addr(h2g_pool_offset)?,
-            ring_span_len: g2h_pool_offset,
             len,
         })
     }
@@ -266,19 +281,9 @@ impl TransportArena {
         self.mbx_addr
     }
 
-    /// Address of the G2H pool.
-    pub const fn g2h_pool_addr(&self) -> u64 {
-        self.g2h_pool_addr
-    }
-
-    /// Address of the H2G pool.
-    pub const fn h2g_pool_addr(&self) -> u64 {
-        self.h2g_pool_addr
-    }
-
     /// Page-aligned length occupied by both rings and the mailbox.
     pub const fn ring_span_len(&self) -> usize {
-        self.ring_span_len
+        self.len
     }
 
     /// Total page-aligned arena length.
@@ -292,15 +297,13 @@ impl TransportArena {
     }
 
     /// Convert the arena's absolute addresses into offsets from the arena base.
-    pub fn to_offsets(&self) -> (usize, usize, usize, usize, usize) {
+    pub fn to_offsets(&self) -> (usize, usize, usize) {
         #[allow(clippy::unwrap_used)] // `new` proves every stored offset fits in `usize`.
         let to_offset = |addr| usize::try_from(addr - self.g2h_ring_addr).unwrap();
 
         (
             to_offset(self.h2g_ring_addr),
             to_offset(self.mbx_addr),
-            to_offset(self.g2h_pool_addr),
-            to_offset(self.h2g_pool_addr),
             self.len,
         )
     }
@@ -326,28 +329,10 @@ mod tests {
                 .is_multiple_of(virtq::Descriptor::ALIGN as u64)
         );
         assert!(arena.mbx_addr().is_multiple_of(align_of::<u64>() as u64));
-        assert!(
-            arena
-                .g2h_pool_addr()
-                .is_multiple_of(crate::vmem::PAGE_SIZE as u64)
-        );
-        assert_eq!(
-            arena.h2g_pool_addr(),
-            base + 9 * crate::vmem::PAGE_SIZE as u64
-        );
-        assert_eq!(arena.end_addr(), base + 13 * crate::vmem::PAGE_SIZE as u64);
-        assert_eq!(
-            arena.to_offsets(),
-            (
-                0x410,
-                0x618,
-                crate::vmem::PAGE_SIZE,
-                9 * crate::vmem::PAGE_SIZE,
-                13 * crate::vmem::PAGE_SIZE,
-            )
-        );
+        assert_eq!(arena.end_addr(), base + crate::vmem::PAGE_SIZE as u64);
+        assert_eq!(arena.to_offsets(), (0x410, 0x618, crate::vmem::PAGE_SIZE));
         assert_eq!(arena.ring_span_len(), crate::vmem::PAGE_SIZE);
-        assert_eq!(arena.size(), 13 * crate::vmem::PAGE_SIZE);
+        assert_eq!(arena.size(), crate::vmem::PAGE_SIZE);
         assert_eq!(
             TransportArena::checked_query_size(g2h, h2g),
             Some(arena.size())
@@ -366,7 +351,7 @@ mod tests {
     #[test]
     fn minimum_scratch_includes_ring_arena_and_pools() {
         let fixed = arch::min_scratch_size().unwrap();
-        let transport_pages = 1 + 8 + 4;
+        let transport_pages = 1 + 8 + 4 + virtq_alias_pt_pages(12).unwrap();
 
         assert_eq!(
             fixed + transport_pages * crate::vmem::PAGE_SIZE,

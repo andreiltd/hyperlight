@@ -638,13 +638,8 @@ impl SandboxMemoryManager<HostSharedMemory> {
 
     /// Reset host consumers and read the guest-side snapshot status.
     ///
-    /// Consumer reset completes the canonical queue before the status is interpreted.
-    /// A retained-buffer rejection therefore leaves both queues usable. The current
-    /// status is only a retained slot count.
-    ///
-    /// TODO: This will change to allow the guest to publish a more detailed snapshot
-    /// status about what buffer ranges were retained so we can include them in the
-    /// snapshot. For now we simply error if the guest has retained any buffers.
+    /// Consumer reset completes the canonical queue before the status is
+    /// interpreted. Stable guest mappings preserve retained slot contents.
     pub(crate) fn finish_snapshot_checkpoint(&mut self) -> Result<u64> {
         let Some(g2h) = self.g2h_consumer.as_mut() else {
             return Err(new_error!("G2H consumer is not attached"));
@@ -1101,7 +1096,7 @@ mod tests {
         let mut mgr = manager(&queue);
         let mut desc = queue.h2g_desc(1);
 
-        desc.addr = queue.h2g_pool.end;
+        desc.addr = queue.payload.end;
         queue.set_h2g_desc(1, desc);
 
         let error = mgr

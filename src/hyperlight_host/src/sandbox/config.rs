@@ -98,7 +98,7 @@ impl SandboxConfiguration {
     pub const DEFAULT_HEAP_SIZE: u64 = 131072;
     /// The default scratch size keeps enough dynamic space to back the default
     /// heap after reserving the transport arena and page tables.
-    pub const DEFAULT_SCRATCH_SIZE: usize = 0x56000;
+    pub const DEFAULT_SCRATCH_SIZE: usize = 0x62000;
     /// The default G2H virtqueue descriptor count.
     pub const DEFAULT_G2H_QUEUE_SIZE: usize = 64;
     /// The default H2G virtqueue descriptor count.

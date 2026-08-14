@@ -1612,6 +1612,7 @@ dependencies = [
  "hyperlight-guest-tracing",
  "serde_json",
  "tracing",
+ "vm-allocator",
 ]
 
 [[package]]
@@ -4212,6 +4213,16 @@ name = "version-compare"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03c2856837ef78f57382f06b2b8563a2f512f7185d732608fd9176cb3b8edf0e"
+
+[[package]]
+name = "vm-allocator"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2feb549d049009150155ab6e1b0c8c0db9ea6805ba5bdc57a27a3b7466e80f5"
+dependencies = [
+ "libc",
+ "thiserror",
+]
 
 [[package]]
 name = "vmm-sys-util"

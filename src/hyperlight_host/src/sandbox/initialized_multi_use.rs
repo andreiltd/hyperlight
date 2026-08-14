@@ -87,6 +87,8 @@ pub struct MultiUseSandbox {
     pub(crate) snapshot: Option<Arc<Snapshot>>,
     /// Whether queue traffic occurred since the last canonical boundary.
     transport_dirty: bool,
+    /// Whether restored guest pools must be rebuilt before queue access.
+    transport_reset_pending: bool,
     /// Optional callback to discover page table roots from guest memory.
     /// Given (snapshot_mem, scratch_mem, cr3), returns a list of root GPAs.
     /// If not set, only CR3 is used as the single root.
@@ -138,6 +140,7 @@ impl MultiUseSandbox {
             vm,
             snapshot: None,
             transport_dirty: false,
+            transport_reset_pending: false,
             pt_root_finder: None,
         }
     }
@@ -333,7 +336,8 @@ impl MultiUseSandbox {
             hshm.restore_virtq(virtq)?;
         }
 
-        let sbox = MultiUseSandbox::from_uninit(host_funcs, hshm, vm);
+        let mut sbox = MultiUseSandbox::from_uninit(host_funcs, hshm, vm);
+        sbox.transport_reset_pending = restore_virtq;
         Ok(sbox)
     }
 
@@ -378,6 +382,8 @@ impl MultiUseSandbox {
         if let Some(snapshot) = &self.snapshot {
             return Ok(snapshot.clone());
         }
+
+        self.maybe_reset_transport()?;
 
         if self.transport_dirty {
             self.checkpoint_transport_for_snapshot()?;
@@ -452,23 +458,11 @@ impl MultiUseSandbox {
             return Err(error);
         }
 
-        let guest_owned = match self.mem_mgr.finish_snapshot_checkpoint() {
-            Ok(guest_owned) => guest_owned,
-            Err(error) => {
-                if error.is_poison_error() {
-                    self.poison();
-                }
-                return Err(error);
+        if let Err(error) = self.mem_mgr.finish_snapshot_checkpoint() {
+            if error.is_poison_error() {
+                self.poison();
             }
-        };
-
-        if guest_owned != 0 {
-            // TODO: Parse retained pool-relative ranges and initialized lengths
-            // from the mailbox, sanitize them, and include them in the snapshot.
-            // The count-only protocol cannot preserve payloads safely.
-            return Err(HyperlightError::Error(format!(
-                "Cannot snapshot while {guest_owned} transport buffers are retained"
-            )));
+            return Err(error);
         }
 
         self.transport_dirty = false;
@@ -666,6 +660,8 @@ impl MultiUseSandbox {
         // The restored snapshot is now our most current snapshot
         self.snapshot = Some(snapshot.clone());
         self.transport_dirty = false;
+        self.transport_reset_pending =
+            matches!(snapshot.next_action(), super::snapshot::NextAction::Call(_));
 
         // Clear poison state when successfully restoring from snapshot.
         //
@@ -952,6 +948,7 @@ impl MultiUseSandbox {
         self.vm.clear_cancel();
 
         let res = (|| {
+            self.maybe_reset_transport()?;
             self.transport_dirty = true;
 
             let fc = FunctionCall::new(
@@ -1009,6 +1006,28 @@ impl MultiUseSandbox {
         // Note: clear_call_active() is automatically called when _guard is dropped here
 
         res
+    }
+
+    fn maybe_reset_transport(&mut self) -> Result<()> {
+        if !self.transport_reset_pending {
+            return Ok(());
+        }
+
+        // TODO: Maybe we should rotate pools during checkpoint and persist
+        // the scratch allocator cursor so restore does not require this VM entry.
+        if let Err(error) = self
+            .vm
+            .dispatch_call_from_host(&mut self.mem_mgr, &self.host_funcs)
+        {
+            let (error, should_poison) = error.promote();
+            if should_poison {
+                self.poison();
+            }
+            return Err(error);
+        }
+
+        self.transport_reset_pending = false;
+        Ok(())
     }
 
     /// Returns a handle for interrupting guest execution.
@@ -1243,8 +1262,8 @@ mod tests {
     use crate::sandbox::SandboxConfiguration;
     use crate::sandbox::uninitialized::{GuestBlob, GuestEnvironment};
     use crate::{
-        GuestBinary, HyperlightError, MultiUseSandbox, Result, SandboxBuilder, SandboxStatus,
-        UninitializedSandbox,
+        GuestBinary, HostFunctions, HyperlightError, MultiUseSandbox, Result, SandboxBuilder,
+        SandboxStatus, UninitializedSandbox,
     };
 
     #[test]
@@ -1519,62 +1538,34 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_reject_retained_transport_buffers_without_poisoning() {
+    fn snapshots_preserve_retained_transport_buffers() {
         let path = simple_guest_as_pathbuf();
-        let mut sandbox = UninitializedSandbox::new(GuestBinary::FilePath(path), None).unwrap();
-        sandbox
-            .register("HostEchoByteChunks", |value: Vec<Bytes>| value)
-            .unwrap();
-
+        let sandbox = UninitializedSandbox::new(GuestBinary::FilePath(path), None).unwrap();
         let mut sandbox = sandbox.evolve().unwrap();
-        let retained = vec![Bytes::from(vec![0xa5; 6 * 1024])];
+        let expected = vec![0xa5; 6 * 1024];
+        let retained = vec![Bytes::copy_from_slice(&expected)];
 
         let retained_len: i32 = sandbox
             .call("RetainGuestByteChunks", retained.clone())
             .unwrap();
-
         assert_eq!(retained_len, 6 * 1024);
 
-        let Err(error) = sandbox.snapshot() else {
-            panic!("snapshot with retained H2G buffers succeeded");
-        };
+        let snapshot = sandbox.snapshot().unwrap();
+        let mut sandbox =
+            MultiUseSandbox::from_snapshot(snapshot, HostFunctions::default(), None).unwrap();
+        let restored: Vec<u8> = sandbox.call("TakeRetainedGuestByteChunks", ()).unwrap();
+        assert_eq!(restored, expected);
 
-        match error {
-            HyperlightError::Error(message) => {
-                assert!(message.contains("transport buffers are retained"))
-            }
-            err => unreachable!("unexpected snapshot error: {err:#}"),
-        }
-        assert!(!sandbox.status().is_poisoned());
-        assert!(sandbox.transport_dirty);
-
-        let released_len: i32 = sandbox.call("ReleaseGuestByteChunks", ()).unwrap();
-        assert_eq!(released_len, retained_len);
-
-        sandbox.snapshot().unwrap();
-        assert!(!sandbox.transport_dirty);
-
+        sandbox
+            .register_host_function("HostEchoByteChunks", |value: Vec<Bytes>| value)
+            .unwrap();
         let retained_len: i32 = sandbox.call("RetainHostByteChunks", retained).unwrap();
         assert_eq!(retained_len, 6 * 1024);
 
-        let Err(error) = sandbox.snapshot() else {
-            panic!("snapshot with retained G2H buffers succeeded");
-        };
-
-        match error {
-            HyperlightError::Error(message) => {
-                assert!(message.contains("transport buffers are retained"))
-            }
-            err => unreachable!("unexpected snapshot error: {err:#}"),
-        }
-        assert!(!sandbox.status().is_poisoned());
-        assert!(sandbox.transport_dirty);
-
-        let released_len: i32 = sandbox.call("ReleaseHostByteChunks", ()).unwrap();
-        assert_eq!(released_len, retained_len);
-
-        sandbox.snapshot().unwrap();
-        assert!(!sandbox.transport_dirty);
+        let snapshot = sandbox.snapshot().unwrap();
+        sandbox.restore(snapshot).unwrap();
+        let restored: Vec<u8> = sandbox.call("TakeRetainedHostByteChunks", ()).unwrap();
+        assert_eq!(restored, expected);
     }
 
     #[test]

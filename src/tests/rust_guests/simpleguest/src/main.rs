@@ -420,6 +420,17 @@ fn release_guest_byte_chunks() -> i32 {
     }
 }
 
+#[guest_function("TakeRetainedGuestByteChunks")]
+fn take_retained_guest_byte_chunks() -> Vec<u8> {
+    // SAFETY: the guest is single threaded, so the static has no concurrent access.
+    #[allow(static_mut_refs)]
+    unsafe {
+        RETAINED_GUEST_CHUNKS
+            .take()
+            .map_or_else(Vec::new, flatten_chunks)
+    }
+}
+
 #[guest_function("RetainHostByteChunks")]
 fn retain_host_byte_chunks(data: Vec<Bytes>) -> Result<i32> {
     let chunks = host_echo_byte_chunks(data)?;
@@ -438,6 +449,25 @@ fn release_host_byte_chunks() -> i32 {
             chunks.iter().map(Bytes::len).sum::<usize>() as i32
         })
     }
+}
+
+#[guest_function("TakeRetainedHostByteChunks")]
+fn take_retained_host_byte_chunks() -> Vec<u8> {
+    // SAFETY: the guest is single threaded, so the static has no concurrent access.
+    #[allow(static_mut_refs)]
+    unsafe {
+        RETAINED_HOST_CHUNKS
+            .take()
+            .map_or_else(Vec::new, flatten_chunks)
+    }
+}
+
+fn flatten_chunks(chunks: Vec<Bytes>) -> Vec<u8> {
+    let mut output = Vec::with_capacity(chunks.iter().map(Bytes::len).sum());
+    for chunk in chunks {
+        output.extend_from_slice(&chunk);
+    }
+    output
 }
 
 #[guest_function("EchoI32")]

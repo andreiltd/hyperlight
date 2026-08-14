@@ -124,6 +124,30 @@ pub unsafe fn map_region(phys_base: u64, virt_base: *mut u8, len: u64, kind: vme
     }
 }
 
+/// Unmap a page-aligned virtual region and invalidate its translations.
+///
+/// # Safety
+///
+/// The caller must ensure no references into the region remain.
+pub unsafe fn unmap_region(virt_base: *mut u8, len: u64) {
+    unsafe {
+        map_region(0, virt_base, len, vmem::MappingKind::Unmapped);
+    }
+
+    let start = virt_base as u64;
+    let end = start + len;
+
+    for addr in (start..end).step_by(vmem::PAGE_SIZE) {
+        unsafe {
+            core::arch::asm!(
+                "invlpg [{}]",
+                in(reg) addr,
+                options(readonly, nostack, preserves_flags)
+            );
+        }
+    }
+}
+
 pub fn virt_to_phys(gva: vmem::VirtAddr) -> impl Iterator<Item = vmem::Mapping> {
     unsafe { vmem::virt_to_phys::<_>(GuestMappingOperations::new(), gva, 1) }
 }

@@ -293,6 +293,24 @@ fn test_tiered_slot_pool_reports_free_tier_counts() {
 }
 
 #[test]
+fn test_tiered_slot_pool_visits_only_free_slots() {
+    let pool = make_tiered_slot_pool(2, 2);
+    let lower = pool.alloc(128).unwrap();
+    let upper = pool.alloc(4096).unwrap();
+    let mut free = Vec::new();
+
+    pool.for_each_free(|allocation| free.push(allocation));
+
+    assert_eq!(free.len(), 2);
+    assert!(
+        free.iter()
+            .all(|allocation| { allocation.addr != lower.addr && allocation.addr != upper.addr })
+    );
+    assert_eq!(free[0].len, 256);
+    assert_eq!(free[1].len, 4096);
+}
+
+#[test]
 fn test_tiered_slot_pool_region_uses_both_tiers() {
     let pool = make_tiered_slot_pool(1, 2);
     let regions = alloc_exact_regions(&pool, [4096 + 128]).unwrap();

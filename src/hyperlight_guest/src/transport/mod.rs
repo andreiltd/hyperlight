@@ -13,7 +13,7 @@ use core::cell::RefCell;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 pub use context::{DispatchAction, GuestContext, QueueConfig};
-pub use mem::GuestMemOps;
+pub use mem::{GuestMemOps, Mapper};
 
 const UNINITIALIZED: u8 = 0;
 const INITIALIZED: u8 = 1;

@@ -898,23 +898,21 @@ mod tests {
         pin_eq!(layout.get_scratch_size(), 0x30000);
         pin_eq!(layout.get_pt_size(), 0);
 
-        pin_eq!(layout.get_pt_base_scratch_offset(), 0x15000);
+        pin_eq!(layout.get_pt_base_scratch_offset(), 0x1000);
 
         let arena = layout.get_transport_arena();
         let scratch_base_gpa = hyperlight_common::layout::scratch_base_gpa(0x30000);
         pin_eq!(arena.g2h_ring_addr() - scratch_base_gpa, 0);
         pin_eq!(arena.h2g_ring_addr() - scratch_base_gpa, 0x410);
         pin_eq!(arena.mbx_addr() - scratch_base_gpa, 0x618);
-        pin_eq!(arena.g2h_pool_addr() - scratch_base_gpa, 0x1000);
-        pin_eq!(arena.h2g_pool_addr() - scratch_base_gpa, 0xd000);
-        pin_eq!(arena.end_addr() - scratch_base_gpa, 0x15000);
+        pin_eq!(arena.end_addr() - scratch_base_gpa, 0x1000);
 
         // The transport arena sits at the scratch base. The page tables
         // follow it. With the `SCRATCH_TOP` pins above, these fix the
         // absolute addresses.
         pin_eq!(
             layout.get_pt_base_gpa() - hyperlight_common::layout::scratch_base_gpa(0x30000),
-            0x15000
+            0x1000
         );
         // pt_size is zero here, so the first free scratch GPA equals
         // the page table base.
@@ -943,20 +941,18 @@ mod tests {
         pin_eq!(layout.get_scratch_size(), 0x40000);
         pin_eq!(layout.get_pt_size(), 0);
 
-        pin_eq!(layout.get_pt_base_scratch_offset(), 0x15000);
+        pin_eq!(layout.get_pt_base_scratch_offset(), 0x1000);
 
         let arena = layout.get_transport_arena();
         let scratch_base_gpa = hyperlight_common::layout::scratch_base_gpa(0x40000);
         pin_eq!(arena.g2h_ring_addr() - scratch_base_gpa, 0);
         pin_eq!(arena.h2g_ring_addr() - scratch_base_gpa, 0x410);
         pin_eq!(arena.mbx_addr() - scratch_base_gpa, 0x618);
-        pin_eq!(arena.g2h_pool_addr() - scratch_base_gpa, 0x1000);
-        pin_eq!(arena.h2g_pool_addr() - scratch_base_gpa, 0xd000);
-        pin_eq!(arena.end_addr() - scratch_base_gpa, 0x15000);
+        pin_eq!(arena.end_addr() - scratch_base_gpa, 0x1000);
 
         pin_eq!(
             layout.get_pt_base_gpa() - hyperlight_common::layout::scratch_base_gpa(0x40000),
-            0x15000
+            0x1000
         );
         pin_eq!(
             layout.get_first_free_scratch_gpa(),

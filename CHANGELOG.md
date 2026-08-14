@@ -12,7 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 * Expose C guest `ByteChunks` values as pointer and length arrays.
 * Return typed `hl_ReturnValue` objects from C guest functions through
   `hl_result_from_*` constructors.
-* Place virtqueue rings and pools in host-owned scratch before page tables.
+* Place virtqueue rings and the checkpoint mailbox in host-owned scratch before
+  page tables. Allocate buffer pools from guest scratch for each generation.
   Snapshot ABI 3 rejects snapshots created with earlier layouts.
 * Require guest logs and all host and guest function calls to use virtqueues.
 * Keep registered Rust guest return values typed until transport encoding so
@@ -21,9 +22,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   rejects snapshots without transport state.
 * Running snapshots checkpoint dirty virtqueues before capture. Ordinary calls
   keep their deferred result path.
-* Reject snapshot capture while guest-owned transport buffers are retained.
+* Preserve guest-owned `ByteChunks` transport buffers across snapshot restore.
 * Use the reclaimed stack pages to raise the default G2H and H2G pools to 12
   and 8 pages.
+* Raise default scratch size to accommodate eager virtqueue pool allocation.
 
 ### Removed
 * Remove legacy stack I/O, its `GuestHandle` methods, and its sandbox

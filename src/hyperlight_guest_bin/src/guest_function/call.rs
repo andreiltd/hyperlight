@@ -83,6 +83,12 @@ pub(crate) fn internal_dispatch_function() {
         tracing::span!(tracing::Level::INFO, "internal_dispatch_function").entered()
     };
 
+    // Reset transient pool state only after restoring a new snapshot generation.
+    let reset = transport::with_ctx(|ctx| ctx.maybe_reset()).expect("Failed to reset transport");
+    if reset {
+        return;
+    }
+
     let dispatch = transport::with_ctx(|ctx| ctx.recv_h2g_dispatch())
         .expect("H2G dispatch deserialization failed");
 

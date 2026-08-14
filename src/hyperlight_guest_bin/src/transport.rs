@@ -5,7 +5,8 @@
 
 use hyperlight_common::layout::{QueueDims, TransportArena};
 use hyperlight_common::virtq::Layout;
-use hyperlight_guest::transport::{GuestContext, QueueConfig};
+use hyperlight_common::vmem::{BasicMapping, MappingKind};
+use hyperlight_guest::transport::{GuestContext, Mapper, QueueConfig};
 use hyperlight_guest::{layout, transport as guest_transport};
 
 use crate::paging::phys_to_virt;
@@ -30,8 +31,6 @@ pub(crate) fn initialize() {
 
     let g2h_ring_gva = scratch_gva(arena.g2h_ring_addr());
     let h2g_ring_gva = scratch_gva(arena.h2g_ring_addr());
-    let g2h_pool_gva = scratch_gva(arena.g2h_pool_addr());
-    let h2g_pool_gva = scratch_gva(arena.h2g_pool_addr());
     let mbx_gva = scratch_gva(arena.mbx_addr());
 
     let g2h_layout =
@@ -43,17 +42,16 @@ pub(crate) fn initialize() {
     let context = GuestContext::new(
         QueueConfig {
             layout: g2h_layout,
-            pool_gva: g2h_pool_gva,
             pool_pages: g2h_pages,
             buffer_size: g2h_bufsz,
         },
         QueueConfig {
             layout: h2g_layout,
-            pool_gva: h2g_pool_gva,
             pool_pages: h2g_pages,
             buffer_size: h2g_bufsz,
         },
         mbx_gva,
+        Mapper::new(map_buf, unmap_buf),
     )
     .expect("failed to create guest context");
 
@@ -89,4 +87,26 @@ fn read_published_h2g() -> (usize, usize, usize) {
     let bufsz = usize::try_from(bufsz_raw).expect("H2G buffer size exceeds usize");
 
     (size, pages, bufsz)
+}
+
+// TODO: we need some injection to the hyperlight_guest crate without creating
+// circular dependencies. Mapper just store this function pointer.
+unsafe fn map_buf(gpa: u64, gva: u64, len: u64) {
+    unsafe {
+        crate::paging::map_region(
+            gpa,
+            gva as *mut u8,
+            len,
+            MappingKind::Basic(BasicMapping {
+                readable: true,
+                writable: true,
+                executable: false,
+            }),
+        );
+    }
+    crate::paging::barrier::first_valid_same_ctx();
+}
+
+unsafe fn unmap_buf(gva: u64, len: u64) {
+    unsafe { crate::paging::unmap_region(gva as *mut u8, len) };
 }

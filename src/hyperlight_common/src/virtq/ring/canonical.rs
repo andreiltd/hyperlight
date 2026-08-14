@@ -260,6 +260,48 @@ where
     Ok(chains)
 }
 
+/// Validate a canonical image with an available descriptor prefix bounded by
+/// `max_avail_descs`.
+///
+/// The first zero descriptor terminates the available prefix. Validation then
+/// rejects any nonzero descriptor after that prefix.
+pub fn validate_canon_prefix<M, F>(
+    mem: &M,
+    layout: Layout,
+    max_avail_descs: usize,
+    validate_buf: F,
+) -> Result<Vec<CanonChain>, ImageError>
+where
+    M: MemOps,
+    F: FnMut(u16, BufferElement) -> bool,
+{
+    let cap = layout.desc_table_len() as usize;
+    let table = unsafe { DescTable::from_raw_parts(layout.desc_table_addr(), cap) };
+
+    let empty = Descriptor::zeroed();
+    let mut avail_descs = cap;
+
+    for pos in 0..cap {
+        let idx = u16::try_from(pos).map_err(|_| RingError::InvalidState)?;
+        let addr = table.desc_addr(idx).ok_or(RingError::InvalidState)?;
+
+        let desc = mem
+            .read_val::<Descriptor>(addr)
+            .map_err(|_| RingError::mem_err(MemOp::ReadDesc, addr))?;
+
+        if desc == empty {
+            avail_descs = pos;
+            break;
+        }
+    }
+
+    if avail_descs > max_avail_descs {
+        return Err(ImageError::desc_count(avail_descs, max_avail_descs));
+    }
+
+    validate_canon_image(mem, layout, avail_descs, validate_buf)
+}
+
 fn read_canon_avail_desc<M: MemOps>(
     mem: &M,
     table: &DescTable,
@@ -592,6 +634,36 @@ mod tests {
             Err(ImageError::DescCount {
                 available: 5,
                 capacity: 4,
+            })
+        ));
+    }
+
+    #[test]
+    fn canon_prefix_accepts_bounded_available_descriptors() {
+        let ring = make_ring(4);
+        let mut producer = make_producer(&ring);
+        producer.submit_one(0x1000, 64, true).unwrap();
+        producer.submit_one(0x2000, 64, true).unwrap();
+
+        let image =
+            validate_canon_prefix(&ring.mem(), ring.layout(), 3, |_, elem| elem.writable).unwrap();
+
+        assert_eq!(image.len(), 2);
+    }
+
+    #[test]
+    fn canon_prefix_rejects_descriptors_after_first_zero() {
+        let ring = make_ring(4);
+        ring.write_desc(
+            1,
+            Descriptor::new(0x1000, 64, 1, DescFlags::WRITE | DescFlags::AVAIL),
+        );
+
+        assert!(matches!(
+            validate_canon_prefix(&ring.mem(), ring.layout(), 4, |_, _| true),
+            Err(ImageError::Desc {
+                index: 1,
+                reason: DescError::ExpectedZero,
             })
         ));
     }

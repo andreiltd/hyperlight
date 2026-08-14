@@ -91,6 +91,21 @@ pub unsafe trait MemOps {
     #[allow(clippy::mut_from_ref)]
     unsafe fn as_mut_slice(&self, addr: u64, len: usize) -> Result<&mut [u8], Self::Error>;
 
+    /// Map a buffer allocation at a stable address.
+    ///
+    /// `len` bytes are initialized within an allocation of `capacity` bytes.
+    /// The default keeps the descriptor address.
+    fn map_buf(&self, addr: u64, _len: usize, _capacity: usize) -> Result<u64, Self::Error> {
+        Ok(addr)
+    }
+
+    /// Release a stable buffer mapping.
+    ///
+    /// The default has no mapping state to release.
+    fn unmap_buf(&self, _addr: u64, _len: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Read a Pod type at the given pointer.
     ///
     /// Implementations must return an error if `addr` is not valid, aligned,
@@ -142,5 +157,13 @@ unsafe impl<T: MemOps> MemOps for Arc<T> {
     #[allow(clippy::mut_from_ref)]
     unsafe fn as_mut_slice(&self, addr: u64, len: usize) -> Result<&mut [u8], Self::Error> {
         unsafe { (**self).as_mut_slice(addr, len) }
+    }
+
+    fn map_buf(&self, addr: u64, len: usize, capacity: usize) -> Result<u64, Self::Error> {
+        (**self).map_buf(addr, len, capacity)
+    }
+
+    fn unmap_buf(&self, addr: u64, len: usize) -> Result<(), Self::Error> {
+        (**self).unmap_buf(addr, len)
     }
 }

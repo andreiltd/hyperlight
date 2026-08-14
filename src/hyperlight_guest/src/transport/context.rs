@@ -20,7 +20,7 @@ use hyperlight_common::virtq::{
     Segments, SendChain, SlotLayout, SlotPool, Token, UsedChain, VirtqError, VirtqProducer,
 };
 
-use super::{GuestMemOps, codec};
+use super::{GuestMemOps, Mapper, codec};
 use crate::bail;
 use crate::error::{GuestErrorContext, Result};
 use crate::exit::out32;
@@ -46,10 +46,10 @@ impl Notifier for H2gNotifier {
 }
 
 /// Type alias for the guest-side G2H producer.
-pub type G2hProducer = VirtqProducer<GuestMemOps, G2hNotifier, SlotPool>;
+type G2hProducer = VirtqProducer<GuestMemOps, G2hNotifier, SlotPool>;
 
 /// Type alias for the guest-side H2G producer.
-pub type H2gProducer = VirtqProducer<GuestMemOps, H2gNotifier, SlotPool>;
+type H2gProducer = VirtqProducer<GuestMemOps, H2gNotifier, SlotPool>;
 
 /// Work selected by one H2G dispatch entry.
 pub enum DispatchAction {
@@ -60,12 +60,10 @@ pub enum DispatchAction {
 }
 
 /// Configuration for one queue passed to [`GuestContext::new`].
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct QueueConfig {
     /// Ring descriptor layout in shared memory.
     pub layout: Layout,
-    /// Base GVA of the buffer pool region.
-    pub pool_gva: u64,
     /// Number of pages in the buffer pool.
     pub pool_pages: usize,
     /// Size of each upper-tier buffer.
@@ -115,19 +113,32 @@ pub struct GuestContext {
     last_host_result: Option<Result<ReturnValue>>,
     /// Error set by a C guest function.
     last_guest_error: Option<GuestError>,
+    /// Guest-to-host queue dimensions for pool regeneration.
+    g2h_config: QueueConfig,
+    /// Host-to-guest queue dimensions for pool regeneration.
+    h2g_config: QueueConfig,
+    /// Snapshot generation used to allocate the active pools.
+    generation: u64,
 }
 
 impl GuestContext {
     /// Create a new context with G2H and H2G queues.
-    pub fn new(g2h: QueueConfig, h2g: QueueConfig, mbx_gva: u64) -> Result<Self> {
-        let g2h_pool = g2h_pool(g2h.pool_gva, g2h.pool_pages, g2h.buffer_size)
-            .with_context(|| "failed to create G2H pool")?;
-        let mem = GuestMemOps::for_scratch();
-        let g2h_producer = VirtqProducer::new(g2h.layout, mem, G2hNotifier, g2h_pool.clone());
+    pub fn new(
+        g2h: QueueConfig,
+        h2g: QueueConfig,
+        mbx_gva: u64,
+        owner_mapper: Mapper,
+    ) -> Result<Self> {
+        let mem = GuestMemOps::for_scratch(owner_mapper);
+        let g2h_pool = g2h_pool(g2h.pool_pages, g2h.buffer_size).map_err(VirtqError::from)?;
+        let g2h_producer =
+            VirtqProducer::new(g2h.layout, mem.clone(), G2hNotifier, g2h_pool.clone());
 
-        let h2g_pool = h2g_pool(h2g.pool_gva, h2g.pool_pages, h2g.buffer_size)
-            .with_context(|| "failed to create H2G slot pool")?;
-        let h2g_producer = VirtqProducer::new(h2g.layout, mem, H2gNotifier, h2g_pool.clone());
+        let h2g_pool = h2g_pool(h2g.pool_pages, h2g.buffer_size).map_err(VirtqError::from)?;
+        let h2g_producer =
+            VirtqProducer::new(h2g.layout, mem.clone(), H2gNotifier, h2g_pool.clone());
+
+        let generation = unsafe { crate::layout::snapshot_generation_gva().read_volatile() };
 
         let mut ctx = Self {
             mem,
@@ -140,10 +151,46 @@ impl GuestContext {
             next_cid: 1,
             last_host_result: None,
             last_guest_error: None,
+            g2h_config: g2h,
+            h2g_config: h2g,
+            generation,
         };
 
         ctx.prefill_h2g()?;
         Ok(ctx)
+    }
+
+    /// Reset transient pool state after restoring a new snapshot generation.
+    ///
+    /// This is a no-op if the snapshot generation has not changed. Returns
+    /// whether the transport was reset.
+    pub fn maybe_reset(&mut self) -> Result<bool> {
+        let generation = unsafe { crate::layout::snapshot_generation_gva().read_volatile() };
+        if generation == self.generation {
+            return Ok(false);
+        }
+
+        self.g2h_producer.reset()?;
+        self.h2g_producer.reset()?;
+
+        let g2h = self.g2h_config;
+        let h2g = self.h2g_config;
+
+        let g2h_pool = g2h_pool(g2h.pool_pages, g2h.buffer_size).map_err(VirtqError::from)?;
+        let h2g_pool = h2g_pool(h2g.pool_pages, h2g.buffer_size).map_err(VirtqError::from)?;
+
+        self.g2h_producer =
+            VirtqProducer::new(g2h.layout, self.mem.clone(), G2hNotifier, g2h_pool.clone());
+        self.h2g_producer =
+            VirtqProducer::new(h2g.layout, self.mem.clone(), H2gNotifier, h2g_pool.clone());
+
+        self.g2h_pool = g2h_pool;
+        self.h2g_pool = h2g_pool;
+
+        self.prefill_h2g()?;
+        self.generation = generation;
+
+        Ok(true)
     }
 
     /// Record an error raised through the C guest API.
@@ -369,16 +416,21 @@ impl GuestContext {
         // transport-owned allocations and must not be counted. The result only
         // answers whether retained buffers exist. It does not identify their
         // addresses, capacities, or initialized lengths.
-        let guest_owned = self
-            .g2h_pool
-            .num_live()
-            .checked_add(self.h2g_pool.num_live())
-            .ok_or(VirtqError::InvalidState)?;
+        let g2h = self.g2h_pool.num_live();
+        let h2g = self.h2g_pool.num_live();
+
+        let guest_owned = g2h.checked_add(h2g).ok_or(VirtqError::InvalidState)?;
         let guest_owned = u64::try_from(guest_owned).map_err(|_| VirtqError::InvalidState)?;
 
-        // TODO: Publish a retained-buffer manifest with pool-relative offsets and
-        // initialized lengths so the host can snapshot sanitized payload ranges.
-        // The count-only mailbox currently rejects every retained-buffer snapshot.
+        if g2h != 0 {
+            zero_free(&self.g2h_pool);
+        }
+        if h2g != 0 {
+            zero_free(&self.h2g_pool);
+        }
+
+        // The host uses this count to distinguish a completed checkpoint from an
+        // incomplete guest entry. Retained payloads use ordinary GVA mappings.
         self.mem
             .write(self.mbx_gva, &guest_owned.to_le_bytes())
             .map_err(|_| VirtqError::MemoryWriteError)?;
@@ -575,10 +627,35 @@ fn pool_len(pages: usize) -> result::Result<usize, AllocError> {
         .ok_or(AllocError::Overflow)
 }
 
+fn scratch_gva(gpa: u64) -> result::Result<u64, AllocError> {
+    let offset = gpa
+        .checked_sub(crate::layout::scratch_base_gpa())
+        .ok_or(AllocError::InvalidArg)?;
+
+    crate::layout::scratch_base_gva()
+        .checked_add(offset)
+        .ok_or(AllocError::Overflow)
+}
+
+fn allocate_pool_base(pages: usize) -> result::Result<u64, AllocError> {
+    let pages = u64::try_from(pages).map_err(|_| AllocError::Overflow)?;
+    let gpa = unsafe { crate::prim_alloc::alloc_phys_pages(pages) };
+    scratch_gva(gpa)
+}
+
+fn zero_free(pool: &SlotPool) {
+    pool.for_each_free(|alloc| {
+        // SAFETY: Free slots remain owned by this pool and cannot be accessed
+        // through a live descriptor or BufferOwner.
+        unsafe { (alloc.addr as *mut u8).write_bytes(0, alloc.len as usize) };
+    });
+}
+
 /// Build the uniform H2G pool.
 ///
 /// Each slot becomes one independent preposted receive buffer.
-fn h2g_pool(base: u64, pages: usize, buffer_size: usize) -> result::Result<SlotPool, AllocError> {
+fn h2g_pool(pages: usize, buffer_size: usize) -> result::Result<SlotPool, AllocError> {
+    let base = allocate_pool_base(pages)?;
     let count = pool_len(pages)? / buffer_size;
     SlotPool::new(SlotLayout::new(base, buffer_size, count))
 }
@@ -588,7 +665,8 @@ fn h2g_pool(base: u64, pages: usize, buffer_size: usize) -> result::Result<SlotP
 /// One page of 256-byte slots serves small control and log messages without
 /// consuming configured-size slots. Complete slots in the remaining pages form
 /// the upper tier.
-fn g2h_pool(base: u64, pages: usize, upper_size: usize) -> result::Result<SlotPool, AllocError> {
+fn g2h_pool(pages: usize, upper_size: usize) -> result::Result<SlotPool, AllocError> {
+    let base = allocate_pool_base(pages)?;
     let pool_len = pool_len(pages)?;
     let lower_len = G2H_LOWER_SLOT_COUNT
         .checked_mul(G2H_LOWER_SLOT_SIZE)
