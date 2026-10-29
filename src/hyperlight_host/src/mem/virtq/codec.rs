@@ -4,27 +4,27 @@
 //! Host RPC encoding and decoding over virtqueue chains.
 
 use anyhow::{Context, bail};
-use flatbuffers::FlatBufferBuilder;
 use hyperlight_common::flatbuffer_wrappers::ExternalValueSource;
-use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
+use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, FunctionCallRef};
 use hyperlight_common::flatbuffer_wrappers::function_types::FunctionCallResult;
 use hyperlight_common::flatbuffer_wrappers::guest_log_data::GuestLogData;
-use hyperlight_common::transport::{
-    EncodedMessage, ExternalValues, MsgHeader, MsgKind, SIZE_PREFIX_LEN,
-};
+use hyperlight_common::transport::{EncodedMessage, ExternalValues, MsgHeader, MsgKind};
 use hyperlight_common::virtq::{RecvChain, WritableChain};
 
 use super::mem::HostMemOps;
 
 /// Decode one complete host function call from a G2H request.
 ///
-/// Control data and external values are copied out of guest-writable scratch.
+/// Control data is copied out of guest-writable scratch into `buffer`. The
+/// function name borrows from `buffer`. External values are copied.
 /// Unconsumed trailing bytes are rejected.
-pub(crate) fn get_host_function_call(
+pub(crate) fn get_host_function_call<'b>(
     chain: &mut RecvChain<HostMemOps>,
-) -> anyhow::Result<FunctionCall> {
-    let control = read_control(chain)?;
-    FunctionCall::decode(&control, chain)
+    header: &MsgHeader,
+    buffer: &'b mut Vec<u8>,
+) -> anyhow::Result<FunctionCallRef<'b>> {
+    let control = read_control(chain, header, buffer)?;
+    FunctionCall::decode_ref(control, chain)
 }
 
 /// Read and validate one complete G2H message header.
@@ -49,9 +49,11 @@ pub(crate) fn read_message_header(
 /// Decode a guest-function result body after its G2H header.
 pub(crate) fn read_guest_function_call_result(
     request: &mut RecvChain<HostMemOps>,
+    header: &MsgHeader,
 ) -> anyhow::Result<FunctionCallResult> {
-    let control = read_control(request)?;
-    FunctionCallResult::decode(&control, request)
+    let mut buffer = Vec::new();
+    let control = read_control(request, header, &mut buffer)?;
+    FunctionCallResult::decode(control, request)
 }
 
 /// Append a complete response when it fits the remaining writable space.
@@ -62,10 +64,10 @@ pub(crate) fn try_write_response(
     cid: u32,
     result: &FunctionCallResult,
 ) -> anyhow::Result<bool> {
-    let mut builder = FlatBufferBuilder::new();
+    let mut buffer = Vec::new();
     let mut externals = ExternalValues::new();
 
-    let control = result.encode(&mut builder, &mut externals)?;
+    let control = result.encode(&mut buffer, &mut externals)?;
     let msg = EncodedMessage::new(MsgKind::Response, cid, control, externals)
         .context("Host function response length overflow")?;
 
@@ -83,50 +85,53 @@ pub(crate) fn try_write_response(
 /// Decode guest log data and reject trailing external bytes.
 pub(crate) fn read_guest_log_data(
     chain: &mut RecvChain<HostMemOps>,
+    header: &MsgHeader,
+    buffer: &mut Vec<u8>,
 ) -> anyhow::Result<GuestLogData> {
-    let control = read_control(chain)?;
+    let control = read_control(chain, header, buffer)?;
     chain.finish()?;
-    GuestLogData::try_from(control.as_slice())
+    GuestLogData::try_from(control)
 }
 
-/// Copy size-prefixed control data and leave external values unread.
-fn read_control(request: &mut RecvChain<HostMemOps>) -> anyhow::Result<Vec<u8>> {
-    let mut prefix = [0u8; SIZE_PREFIX_LEN];
-    request.read_exact(&mut prefix)?;
-
-    let payload_len = u32::from_le_bytes(prefix) as usize;
-    if payload_len > request.remaining() {
+/// Copy the header's control data into `buffer` and leave external values
+/// unread.
+fn read_control<'b>(
+    request: &mut RecvChain<HostMemOps>,
+    header: &MsgHeader,
+    buffer: &'b mut Vec<u8>,
+) -> anyhow::Result<&'b [u8]> {
+    let control_len = header.control_len as usize;
+    if control_len > request.remaining() {
         bail!(
-            "G2H control data declares {payload_len} bytes, only {} remain",
+            "G2H control data declares {control_len} bytes, only {} remain",
             request.remaining()
         );
     }
 
-    // The prefix and payload fit within the original chain length.
-    let control_len = SIZE_PREFIX_LEN + payload_len;
-    let mut control = zeroed_vec(control_len, "G2H control data")?;
+    grow_zeroed(buffer, control_len, "G2H control data")?;
 
-    control[..SIZE_PREFIX_LEN].copy_from_slice(&prefix);
-    request.read_exact(&mut control[SIZE_PREFIX_LEN..])?;
+    let control = &mut buffer[..control_len];
+    request.read_exact(control)?;
 
     Ok(control)
 }
 
-/// Allocate zeroed host-owned storage without panicking on reserve failure.
-fn zeroed_vec(length: usize, what: &str) -> anyhow::Result<Vec<u8>> {
-    let mut value = Vec::new();
-    value
-        .try_reserve_exact(length)
-        .with_context(|| format!("Failed to allocate {length} bytes for {what}"))?;
-
-    value.resize(length, 0);
-    Ok(value)
+/// Grow `buffer` to at least `length` bytes without panicking on reserve
+/// failure.
+fn grow_zeroed(buffer: &mut Vec<u8>, length: usize, what: &str) -> anyhow::Result<()> {
+    if let Some(additional) = length.checked_sub(buffer.len()) {
+        buffer
+            .try_reserve_exact(additional)
+            .with_context(|| format!("Failed to allocate {length} bytes for {what}"))?;
+        buffer.resize(length, 0);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use hyperlight_common::flatbuffer_wrappers::function_types::ReturnValue;
-    use hyperlight_common::virtq::{BufferChainBuilder, MemOps, RingProducer, VirtqError};
+    use hyperlight_common::virtq::{BufferChainBuilder, MemOps, RingProducer};
 
     use super::*;
     use crate::mem::virtq::tests::TestCase;
@@ -153,28 +158,17 @@ mod tests {
 
     #[test]
     fn oversized_allocation_fails_without_panicking() {
-        assert!(zeroed_vec(usize::MAX, "test buffer").is_err());
+        assert!(grow_zeroed(&mut Vec::new(), usize::MAX, "test buffer").is_err());
     }
 
-    #[test]
-    fn read_control_rejects_truncated_prefix() {
-        with_control(b"\x04\0\0", |request| {
-            let error = read_control(request).unwrap_err();
-            assert!(matches!(
-                error.downcast_ref::<VirtqError>(),
-                Some(VirtqError::ReceiveTooShort {
-                    requested: SIZE_PREFIX_LEN,
-                    remaining: 3,
-                })
-            ));
-            assert_eq!(request.consumed(), 0);
-        });
+    fn header(payload_len: u32, control_len: u32) -> MsgHeader {
+        MsgHeader::new(MsgKind::Request, 1, payload_len, control_len)
     }
 
     #[test]
     fn read_control_rejects_truncated_body() {
-        with_control(b"\x04\0\0\0ctr", |request| {
-            let error = read_control(request).unwrap_err();
+        with_control(b"ctr", |request| {
+            let error = read_control(request, &header(4, 4), &mut Vec::new()).unwrap_err();
             assert_eq!(
                 error.to_string(),
                 "G2H control data declares 4 bytes, only 3 remain"
@@ -184,24 +178,37 @@ mod tests {
     }
 
     #[test]
+    fn read_message_header_rejects_control_longer_than_payload() {
+        let mut message = header(3, 4).as_bytes().to_vec();
+        message.extend_from_slice(b"ext");
+        with_control(&message, |request| {
+            let error = read_message_header(request).unwrap_err();
+            assert_eq!(error.to_string(), "G2H message has an invalid header");
+        });
+    }
+
+    #[test]
     fn read_control_leaves_external_bytes_unread() {
         let case = TestCase::new();
         let mut producer = RingProducer::new(case.g2h_layout, case.mem.clone());
-        let payload = b"\x04\0\0\0ctrlext";
+        let payload = b"ctrlext";
         let addr = case.g2h_pool_base;
         case.mem.write(addr, payload).unwrap();
 
         let chain = BufferChainBuilder::new()
             .readable(addr, 2)
-            .readable(addr + 2, 5)
-            .readable(addr + 7, 4)
+            .readable(addr + 2, 3)
+            .readable(addr + 5, 2)
             .build()
             .unwrap();
         producer.submit_available(&chain).unwrap();
 
         let mut consumer = case.g2h_consumer();
         let (mut request, reply) = consumer.poll(payload.len()).unwrap().unwrap();
-        assert_eq!(read_control(&mut request).unwrap(), b"\x04\0\0\0ctrl");
+        assert_eq!(
+            read_control(&mut request, &header(7, 4), &mut Vec::new()).unwrap(),
+            b"ctrl"
+        );
         assert_eq!(request.remaining(), 3);
 
         let mut external = [0; 3];
@@ -221,10 +228,10 @@ mod tests {
         };
 
         let result = FunctionCallResult::new(Ok(ReturnValue::UInt(17)));
-        let mut builder = FlatBufferBuilder::new();
+        let mut buffer = Vec::new();
         let mut externals = ExternalValues::new();
 
-        let control = result.encode(&mut builder, &mut externals).unwrap();
+        let control = result.encode(&mut buffer, &mut externals).unwrap();
         let message = EncodedMessage::new(MsgKind::Response, 7, control, externals).unwrap();
 
         let prefix = vec![0xa5; reply.capacity() - message.total_len() + 1];
@@ -249,10 +256,10 @@ mod tests {
         };
 
         let result = FunctionCallResult::new(Ok(ReturnValue::UInt(17)));
-        let mut builder = FlatBufferBuilder::new();
+        let mut buffer = Vec::new();
         let mut externals = ExternalValues::new();
 
-        let control = result.encode(&mut builder, &mut externals).unwrap();
+        let control = result.encode(&mut buffer, &mut externals).unwrap();
         let message = EncodedMessage::new(MsgKind::Response, 7, control, externals).unwrap();
 
         let expected: Vec<_> = message.chunks().flatten().copied().collect();

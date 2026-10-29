@@ -17,5 +17,6 @@ pub mod host_function_definition;
 /// cbindgen:ignore
 pub mod host_function_details;
 pub mod util;
+mod wire;
 
 pub use codec::{ExternalValueSink, ExternalValueSource};

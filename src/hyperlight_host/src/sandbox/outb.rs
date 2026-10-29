@@ -255,7 +255,8 @@ fn outb_virtq_call(
                     ));
                 }
 
-                let log = virtq::read_guest_log_data(&mut request)
+                let mut control = Vec::new();
+                let log = virtq::read_guest_log_data(&mut request, &header, &mut control)
                     .map_err(|error| HandleOutbError::ReadHostFunctionCall(error.to_string()))?;
 
                 emit_guest_log(&log);
@@ -286,22 +287,22 @@ fn outb_virtq_call(
         )
     })?;
 
-    let call = virtq::get_host_function_call(&mut request)
+    let mut control = Vec::new();
+    let call = virtq::get_host_function_call(&mut request, &header, &mut control)
         .map_err(|error| HandleOutbError::ReadHostFunctionCall(error.to_string()))?;
 
-    if call.function_call_type() != FunctionCallType::Host {
+    if call.function_call_type != FunctionCallType::Host {
         return Err(HandleOutbError::ReadHostFunctionCall(
             "G2H request does not target a host function".into(),
         ));
     }
 
-    let name = call.function_name;
     let args = call.parameters.unwrap_or_default();
 
     let result = host_funcs
         .try_lock()
         .map_err(|err| HandleOutbError::LockFailed(file!(), line!(), err.to_string()))?
-        .call_host_function(&name, args)
+        .call_host_function(call.function_name, args)
         .map_err(|err| GuestError::new(ErrorCode::HostFunctionError, err.to_string()));
 
     let result = FunctionCallResult::new(result);
