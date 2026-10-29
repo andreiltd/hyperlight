@@ -16,10 +16,6 @@ use super::guest_error::GuestError;
 use super::util::arbitrary_byte_chunks;
 use super::util::try_byte_chunks_len;
 use super::wire::{WireResult, WireValue, decode_value, encode_value};
-use crate::flatbuffers::hyperlight::generated::{
-    Parameter, ParameterType as FbParameterType, ParameterValue as FbParameterValue,
-    ReturnType as FbReturnType, ReturnValue as FbReturnValue, ReturnValueBox,
-};
 
 pub struct FunctionCallResult(core::result::Result<ReturnValue, GuestError>);
 
@@ -308,130 +304,6 @@ impl From<&ParameterValue> for ParameterType {
     }
 }
 
-impl TryFrom<Parameter<'_>> for ParameterValue {
-    type Error = Error;
-
-    #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
-    fn try_from(param: Parameter<'_>) -> Result<Self> {
-        let value = param.value_type();
-        let result = match value {
-            FbParameterValue::hlint => param
-                .value_as_hlint()
-                .map(|hlint| ParameterValue::Int(hlint.value())),
-            FbParameterValue::hluint => param
-                .value_as_hluint()
-                .map(|hluint| ParameterValue::UInt(hluint.value())),
-            FbParameterValue::hllong => param
-                .value_as_hllong()
-                .map(|hllong| ParameterValue::Long(hllong.value())),
-            FbParameterValue::hlulong => param
-                .value_as_hlulong()
-                .map(|hlulong| ParameterValue::ULong(hlulong.value())),
-            FbParameterValue::hlfloat => param
-                .value_as_hlfloat()
-                .map(|hlfloat| ParameterValue::Float(hlfloat.value())),
-            FbParameterValue::hldouble => param
-                .value_as_hldouble()
-                .map(|hldouble| ParameterValue::Double(hldouble.value())),
-            FbParameterValue::hlbool => param
-                .value_as_hlbool()
-                .map(|hlbool| ParameterValue::Bool(hlbool.value())),
-            FbParameterValue::hlstring => param.value_as_hlstring().map(|hlstring| {
-                ParameterValue::String(hlstring.value().unwrap_or_default().to_string())
-            }),
-            FbParameterValue::hlexternalbytes => {
-                bail!("External byte parameter requires an external value source")
-            }
-            other => {
-                bail!("Unexpected flatbuffer parameter value type: {:?}", other);
-            }
-        };
-        result.ok_or_else(|| anyhow!("Failed to get parameter value"))
-    }
-}
-
-impl From<ParameterType> for FbParameterType {
-    #[cfg_attr(feature = "tracing", instrument(skip_all, parent = Span::current(), level= "Trace"))]
-    fn from(value: ParameterType) -> Self {
-        match value {
-            ParameterType::Int => FbParameterType::hlint,
-            ParameterType::UInt => FbParameterType::hluint,
-            ParameterType::Long => FbParameterType::hllong,
-            ParameterType::ULong => FbParameterType::hlulong,
-            ParameterType::Float => FbParameterType::hlfloat,
-            ParameterType::Double => FbParameterType::hldouble,
-            ParameterType::String => FbParameterType::hlstring,
-            ParameterType::Bool => FbParameterType::hlbool,
-            ParameterType::VecBytes => FbParameterType::hlvecbytes,
-            ParameterType::ByteChunks => FbParameterType::hlbytechunks,
-        }
-    }
-}
-
-impl From<ReturnType> for FbReturnType {
-    #[cfg_attr(feature = "tracing", instrument(skip_all, parent = Span::current(), level= "Trace"))]
-    fn from(value: ReturnType) -> Self {
-        match value {
-            ReturnType::Int => FbReturnType::hlint,
-            ReturnType::UInt => FbReturnType::hluint,
-            ReturnType::Long => FbReturnType::hllong,
-            ReturnType::ULong => FbReturnType::hlulong,
-            ReturnType::Float => FbReturnType::hlfloat,
-            ReturnType::Double => FbReturnType::hldouble,
-            ReturnType::String => FbReturnType::hlstring,
-            ReturnType::Bool => FbReturnType::hlbool,
-            ReturnType::Void => FbReturnType::hlvoid,
-            ReturnType::VecBytes => FbReturnType::hlsizeprefixedbuffer,
-            ReturnType::ByteChunks => FbReturnType::hlbytechunks,
-        }
-    }
-}
-
-impl TryFrom<FbParameterType> for ParameterType {
-    type Error = Error;
-    #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
-    fn try_from(value: FbParameterType) -> Result<Self> {
-        match value {
-            FbParameterType::hlint => Ok(ParameterType::Int),
-            FbParameterType::hluint => Ok(ParameterType::UInt),
-            FbParameterType::hllong => Ok(ParameterType::Long),
-            FbParameterType::hlulong => Ok(ParameterType::ULong),
-            FbParameterType::hlfloat => Ok(ParameterType::Float),
-            FbParameterType::hldouble => Ok(ParameterType::Double),
-            FbParameterType::hlstring => Ok(ParameterType::String),
-            FbParameterType::hlbool => Ok(ParameterType::Bool),
-            FbParameterType::hlvecbytes => Ok(ParameterType::VecBytes),
-            FbParameterType::hlbytechunks => Ok(ParameterType::ByteChunks),
-            _ => {
-                bail!("Unexpected flatbuffer parameter type: {:?}", value)
-            }
-        }
-    }
-}
-
-impl TryFrom<FbReturnType> for ReturnType {
-    type Error = Error;
-    #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
-    fn try_from(value: FbReturnType) -> Result<Self> {
-        match value {
-            FbReturnType::hlint => Ok(ReturnType::Int),
-            FbReturnType::hluint => Ok(ReturnType::UInt),
-            FbReturnType::hllong => Ok(ReturnType::Long),
-            FbReturnType::hlulong => Ok(ReturnType::ULong),
-            FbReturnType::hlfloat => Ok(ReturnType::Float),
-            FbReturnType::hldouble => Ok(ReturnType::Double),
-            FbReturnType::hlstring => Ok(ReturnType::String),
-            FbReturnType::hlbool => Ok(ReturnType::Bool),
-            FbReturnType::hlvoid => Ok(ReturnType::Void),
-            FbReturnType::hlsizeprefixedbuffer => Ok(ReturnType::VecBytes),
-            FbReturnType::hlbytechunks => Ok(ReturnType::ByteChunks),
-            _ => {
-                bail!("Unexpected flatbuffer return type: {:?}", value)
-            }
-        }
-    }
-}
-
 impl TryFrom<ParameterValue> for i32 {
     type Error = Error;
     #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
@@ -701,71 +573,6 @@ impl TryFrom<ReturnValue> for () {
     }
 }
 
-impl TryFrom<ReturnValueBox<'_>> for ReturnValue {
-    type Error = Error;
-    #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
-    fn try_from(return_value_box: ReturnValueBox<'_>) -> Result<Self> {
-        match return_value_box.value_type() {
-            FbReturnValue::hlint => {
-                let hlint = return_value_box
-                    .value_as_hlint()
-                    .ok_or_else(|| anyhow!("Failed to get hlint from return value"))?;
-                Ok(ReturnValue::Int(hlint.value()))
-            }
-            FbReturnValue::hluint => {
-                let hluint = return_value_box
-                    .value_as_hluint()
-                    .ok_or_else(|| anyhow!("Failed to get hluint from return value"))?;
-                Ok(ReturnValue::UInt(hluint.value()))
-            }
-            FbReturnValue::hllong => {
-                let hllong = return_value_box
-                    .value_as_hllong()
-                    .ok_or_else(|| anyhow!("Failed to get hllong from return value"))?;
-                Ok(ReturnValue::Long(hllong.value()))
-            }
-            FbReturnValue::hlulong => {
-                let hlulong = return_value_box
-                    .value_as_hlulong()
-                    .ok_or_else(|| anyhow!("Failed to get hlulong from return value"))?;
-                Ok(ReturnValue::ULong(hlulong.value()))
-            }
-            FbReturnValue::hlfloat => {
-                let hlfloat = return_value_box
-                    .value_as_hlfloat()
-                    .ok_or_else(|| anyhow!("Failed to get hlfloat from return value"))?;
-                Ok(ReturnValue::Float(hlfloat.value()))
-            }
-            FbReturnValue::hldouble => {
-                let hldouble = return_value_box
-                    .value_as_hldouble()
-                    .ok_or_else(|| anyhow!("Failed to get hldouble from return value"))?;
-                Ok(ReturnValue::Double(hldouble.value()))
-            }
-            FbReturnValue::hlbool => {
-                let hlbool = return_value_box
-                    .value_as_hlbool()
-                    .ok_or_else(|| anyhow!("Failed to get hlbool from return value"))?;
-                Ok(ReturnValue::Bool(hlbool.value()))
-            }
-            FbReturnValue::hlstring => {
-                let hlstring = match return_value_box.value_as_hlstring() {
-                    Some(hlstring) => hlstring.value().map(|v| v.to_string()),
-                    None => None,
-                };
-                Ok(ReturnValue::String(hlstring.unwrap_or("".to_string())))
-            }
-            FbReturnValue::hlvoid => Ok(ReturnValue::Void(())),
-            FbReturnValue::hlexternalbytes => {
-                bail!("External byte return requires an external value source")
-            }
-            other => {
-                bail!("Unexpected flatbuffer return value type: {:?}", other)
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use alloc::collections::VecDeque;
@@ -835,14 +642,6 @@ mod tests {
                 anyhow::bail!("Unused external values")
             }
         }
-    }
-
-    #[test]
-    fn logical_byte_type_tags_are_stable() {
-        assert_eq!(FbParameterType::from(ParameterType::VecBytes).0, 8);
-        assert_eq!(FbParameterType::from(ParameterType::ByteChunks).0, 9);
-        assert_eq!(FbReturnType::from(ReturnType::VecBytes).0, 9);
-        assert_eq!(FbReturnType::from(ReturnType::ByteChunks).0, 10);
     }
 
     #[test]

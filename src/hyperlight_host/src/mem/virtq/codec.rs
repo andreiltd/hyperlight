@@ -83,14 +83,14 @@ pub(crate) fn try_write_response(
 }
 
 /// Decode guest log data and reject trailing external bytes.
-pub(crate) fn read_guest_log_data(
+pub(crate) fn read_guest_log_data<'b>(
     chain: &mut RecvChain<HostMemOps>,
     header: &MsgHeader,
-    buffer: &mut Vec<u8>,
-) -> anyhow::Result<GuestLogData> {
+    buffer: &'b mut Vec<u8>,
+) -> anyhow::Result<GuestLogData<'b>> {
     let control = read_control(chain, header, buffer)?;
     chain.finish()?;
-    GuestLogData::try_from(control)
+    GuestLogData::decode(control)
 }
 
 /// Copy the header's control data into `buffer` and leave external values

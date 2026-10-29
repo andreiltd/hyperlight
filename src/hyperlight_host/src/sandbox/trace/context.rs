@@ -19,55 +19,41 @@ use crate::mem::mgr::SandboxMemoryManager;
 use crate::mem::shared_mem::HostSharedMemory;
 use crate::{Result, new_error};
 
-/// Type that helps get the data from the guest provided the registers and memory access
-struct EventsBatch {
-    events: Vec<GuestEvent>,
-}
+/// Reads a batch of guest trace events from guest memory.
+///
+/// The guest passes the trace data pointer as a Guest Virtual Address (GVA)
+/// in register r9. With Copy-on-Write enabled, this GVA may not be
+/// identity-mapped to its physical address, so we walk the guest page
+/// tables to translate GVA → GPA before reading the data.
+///
+/// # Arguments
+/// * `regs` - The guest registers (r8 = magic, r9 = GVA pointer, r10 = length)
+/// * `mem_mgr` - The sandbox memory manager with access to shared and scratch memory
+/// * `root_pt` - The root page table physical address (CR3) for GVA translation
+fn read_trace_batch(
+    regs: &CommonRegisters,
+    mem_mgr: &mut SandboxMemoryManager<HostSharedMemory>,
+    root_pt: u64,
+) -> Result<Vec<u8>> {
+    let magic_no = regs.r8;
+    let trace_data_gva = regs.r9;
+    let trace_data_len = regs.r10 as usize;
 
-impl EventsBatch {
-    /// Extract a batch of guest trace events from guest memory.
-    ///
-    /// The guest passes the trace data pointer as a Guest Virtual Address (GVA)
-    /// in register r9. With Copy-on-Write enabled, this GVA may not be
-    /// identity-mapped to its physical address, so we walk the guest page
-    /// tables to translate GVA → GPA before reading the data.
-    ///
-    /// # Arguments
-    /// * `regs` - The guest registers (r8 = magic, r9 = GVA pointer, r10 = length)
-    /// * `mem_mgr` - The sandbox memory manager with access to shared and scratch memory
-    /// * `root_pt` - The root page table physical address (CR3) for GVA translation
-    fn from_regs(
-        regs: &CommonRegisters,
-        mem_mgr: &mut SandboxMemoryManager<HostSharedMemory>,
-        root_pt: u64,
-    ) -> Result<Self> {
-        let magic_no = regs.r8;
-        let trace_data_gva = regs.r9;
-        let trace_data_len = regs.r10 as usize;
-
-        // Validate the magic number to ensure the guest is providing trace data
-        if magic_no != OutBAction::TraceBatch as u64 {
-            return Err(new_error!("A TraceBatch is not present"));
-        }
-
-        // Validate the length to prevent reading excessive memory
-        if trace_data_len == 0 || trace_data_len > MAX_TRACE_DATA_SIZE {
-            return Err(new_error!("Invalid TraceBatch length: {}", trace_data_len));
-        }
-
-        // Read the trace data from guest memory by walking the page tables
-        // to translate the GVA to physical addresses. This is necessary
-        // because with CoW, guest virtual pages are backed by physical
-        // pages in the scratch region rather than being identity-mapped.
-        let buf = mem_mgr.read_guest_memory_by_gva(trace_data_gva, trace_data_len, root_pt)?;
-
-        let events = EventsBatchDecoder {}.decode(&buf).map_err(|e| {
-            tracing::error!("Failed to deserialize guest trace events: {:?}", e);
-            new_error!("Failed to deserialize guest trace events: {:?}", e)
-        })?;
-
-        Ok(EventsBatch { events })
+    // Validate the magic number to ensure the guest is providing trace data
+    if magic_no != OutBAction::TraceBatch as u64 {
+        return Err(new_error!("A TraceBatch is not present"));
     }
+
+    // Validate the length to prevent reading excessive memory
+    if trace_data_len == 0 || trace_data_len > MAX_TRACE_DATA_SIZE {
+        return Err(new_error!("Invalid TraceBatch length: {}", trace_data_len));
+    }
+
+    // Read the trace data from guest memory by walking the page tables
+    // to translate the GVA to physical addresses. This is necessary
+    // because with CoW, guest virtual pages are backed by physical
+    // pages in the scratch region rather than being identity-mapped.
+    mem_mgr.read_guest_memory_by_gva(trace_data_gva, trace_data_len, root_pt)
 }
 
 /// This structure handles the guest tracing information.
@@ -196,13 +182,16 @@ impl TraceContext {
         mem_mgr: &mut SandboxMemoryManager<HostSharedMemory>,
         root_pt: u64,
     ) -> Result<()> {
-        // Get the guest sent info
-        let trace_batch = EventsBatch::from_regs(regs, mem_mgr, root_pt)?;
+        let buf = read_trace_batch(regs, mem_mgr, root_pt)?;
+        let events = EventsBatchDecoder.decode(&buf).map_err(|e| {
+            tracing::error!("Failed to deserialize guest trace events: {:?}", e);
+            new_error!("Failed to deserialize guest trace events: {:?}", e)
+        })?;
 
-        self.handle_trace_impl(trace_batch.events)
+        self.handle_trace_impl(events)
     }
 
-    fn handle_trace_impl(&mut self, events: Vec<GuestEvent>) -> Result<()> {
+    fn handle_trace_impl(&mut self, events: Vec<GuestEvent<'_>>) -> Result<()> {
         let tracer = global::tracer("guest-tracer");
 
         // Stack to keep track of open spans
@@ -221,11 +210,8 @@ impl TraceContext {
                 GuestEvent::EditSpan { id, fields } => {
                     // Edit existing span attributes
                     if let Some(span) = self.guest_spans.get_mut(&id) {
-                        for EventKeyValue { key, value } in fields.iter() {
-                            span.set_attribute(KeyValue::new(
-                                key.as_str().to_string(),
-                                value.as_str().to_string(),
-                            ));
+                        for EventKeyValue { key, value } in fields {
+                            span.set_attribute(KeyValue::new(key.into_owned(), value.into_owned()));
                         }
                     } else {
                         tracing::warn!("Tried to edit non-existing guest span with id {}", id);
@@ -275,11 +261,8 @@ impl TraceContext {
                     let mut span = sb.start_with_context(&tracer, &parent_ctx);
 
                     // Set attributes from fields
-                    for EventKeyValue { key, value } in fields.iter() {
-                        span.set_attribute(KeyValue::new(
-                            key.as_str().to_string(),
-                            value.as_str().to_string(),
-                        ));
+                    for EventKeyValue { key, value } in fields {
+                        span.set_attribute(KeyValue::new(key.into_owned(), value.into_owned()));
                     }
 
                     // Store the span
@@ -321,7 +304,9 @@ impl TraceContext {
                     if let Some(span) = self.guest_spans.get_mut(&parent_id) {
                         let attributes: Vec<KeyValue> = fields
                             .into_iter()
-                            .map(|EventKeyValue { key, value }| KeyValue::new(key, value))
+                            .map(|EventKeyValue { key, value }| {
+                                KeyValue::new(key.into_owned(), value.into_owned())
+                            })
                             .collect();
                         span.add_event_with_timestamp(name.to_string(), ts, attributes);
                     } else {
@@ -404,34 +389,34 @@ mod tests {
     fn create_open_span(
         id: u64,
         parent_id: Option<u64>,
-        name_str: &str,
-        target_str: &str,
+        name_str: &'static str,
+        target_str: &'static str,
         start_tsc: u64,
-        fields: Vec<EventKeyValue>,
-    ) -> GuestEvent {
+        fields: Vec<EventKeyValue<'static>>,
+    ) -> GuestEvent<'static> {
         GuestEvent::OpenSpan {
             id,
             parent_id,
-            name: String::from(name_str),
-            target: String::from(target_str),
+            name: name_str.into(),
+            target: target_str.into(),
             tsc: start_tsc,
             fields,
         }
     }
 
-    fn create_close_span(id: u64, end_tsc: u64) -> GuestEvent {
+    fn create_close_span(id: u64, end_tsc: u64) -> GuestEvent<'static> {
         GuestEvent::CloseSpan { id, tsc: end_tsc }
     }
 
     fn create_log_event(
         parent_id: u64,
         tsc: u64,
-        name_str: &str,
-        fields: Vec<EventKeyValue>,
-    ) -> GuestEvent {
+        name_str: &'static str,
+        fields: Vec<EventKeyValue<'static>>,
+    ) -> GuestEvent<'static> {
         GuestEvent::LogEvent {
             parent_id,
-            name: String::from(name_str),
+            name: name_str.into(),
             tsc,
             fields,
         }

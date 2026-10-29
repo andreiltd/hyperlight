@@ -1,115 +1,108 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025 The Hyperlight Authors.
 
-use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use anyhow::{Error, Result, anyhow};
-use flatbuffers::size_prefixed_root;
-#[cfg(feature = "tracing")]
-use tracing::{Span, instrument};
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use super::guest_log_level::LogLevel;
-use crate::flatbuffers::hyperlight::generated::{
-    GuestLogData as FbGuestLogData, GuestLogDataArgs as FbGuestLogDataArgs, LogLevel as FbLogLevel,
-};
+use super::wire::{decode_value, encode_value};
 
-/// The guest log data for a VM sandbox
-#[derive(Eq, PartialEq, Debug, Clone)]
+/// A guest log record. Strings borrow from the sender's storage when encoded
+/// and from the control data when decoded. Field order is the wire order.
+#[derive(Eq, PartialEq, Debug, Clone, Copy, Serialize, Deserialize)]
 #[allow(missing_docs)]
-pub struct GuestLogData {
-    pub message: String,
-    pub source: String,
+pub struct GuestLogData<'a> {
+    pub message: &'a str,
+    pub source: &'a str,
     pub level: LogLevel,
-    pub caller: String,
-    pub source_file: String,
+    pub caller: &'a str,
+    pub source_file: &'a str,
     pub line: u32,
 }
 
-impl GuestLogData {
-    #[cfg_attr(feature = "tracing", instrument(skip_all, parent = Span::current(), level= "Trace"))]
-    pub fn new(
-        message: String,
-        source: String,
-        level: LogLevel,
-        caller: String,
-        source_file: String,
-        line: u32,
-    ) -> Self {
-        Self {
-            message,
-            source,
-            level,
-            caller,
-            source_file,
-            line,
+impl<'a> GuestLogData<'a> {
+    /// Encode control data into `buffer`.
+    pub fn encode<'b>(&self, buffer: &'b mut Vec<u8>) -> Result<&'b [u8]> {
+        encode_value(self, buffer)
+    }
+
+    /// Decode control data. Strings borrow from `value`.
+    pub fn decode(value: &'a [u8]) -> Result<Self> {
+        decode_value(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> GuestLogData<'static> {
+        GuestLogData {
+            message: "message",
+            source: "source",
+            level: LogLevel::Warning,
+            caller: "caller",
+            source_file: "file.rs",
+            line: 42,
         }
     }
-}
 
-impl TryFrom<&[u8]> for GuestLogData {
-    type Error = Error;
-    #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
-    fn try_from(raw_bytes: &[u8]) -> Result<Self> {
-        let gld_gen = size_prefixed_root::<FbGuestLogData>(raw_bytes)
-            .map_err(|e| anyhow!("Error while reading GuestLogData: {:?}", e))?;
-        let message = convert_generated_option("message", gld_gen.message())?;
-        let source = convert_generated_option("source", gld_gen.source())?;
-        let level = LogLevel::try_from(&gld_gen.level())?;
-        let caller = convert_generated_option("caller", gld_gen.caller())?;
-        let source_file = convert_generated_option("source file", gld_gen.source_file())?;
-        let line = gld_gen.line();
+    #[test]
+    fn wire_bytes_are_stable() {
+        // Changing these bytes changes the wire format and needs a snapshot ABI bump.
+        let log = GuestLogData {
+            message: "m",
+            source: "s",
+            level: LogLevel::Warning,
+            caller: "c",
+            source_file: "f",
+            line: 300,
+        };
+        let mut buffer = Vec::new();
+        let encoded = log.encode(&mut buffer).unwrap();
 
-        Ok(GuestLogData {
-            message,
-            source,
-            level,
-            caller,
-            source_file,
-            line,
-        })
+        #[rustfmt::skip]
+        let expected = [
+            1, b'm', // message
+            1, b's', // source
+            3,       // LogLevel::Warning
+            1, b'c', // caller
+            1, b'f', // source_file
+            0xac, 2, // line, varint 300
+        ];
+        assert_eq!(encoded, expected);
     }
-}
 
-impl TryFrom<&GuestLogData> for Vec<u8> {
-    type Error = Error;
-    #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
-    fn try_from(value: &GuestLogData) -> Result<Vec<u8>> {
-        let mut builder = flatbuffers::FlatBufferBuilder::new();
-        let message = builder.create_string(&value.message);
-        let source = builder.create_string(&value.source);
-        let caller = builder.create_string(&value.caller);
-        let source_file = builder.create_string(&value.source_file);
-        let level = FbLogLevel::from(&value.level);
+    #[test]
+    fn round_trips_and_borrows() {
+        let log = sample();
+        let mut buffer = Vec::new();
+        let encoded = log.encode(&mut buffer).unwrap();
+        let decoded = GuestLogData::decode(encoded).unwrap();
 
-        let guest_log_data_fb = FbGuestLogData::create(
-            &mut builder,
-            &FbGuestLogDataArgs {
-                message: Some(message),
-                source: Some(source),
-                level,
-                caller: Some(caller),
-                source_file: Some(source_file),
-                line: value.line,
-            },
-        );
-        builder.finish_size_prefixed(guest_log_data_fb, None);
-        let res = builder.finished_data().to_vec();
-
-        Ok(res)
+        assert_eq!(decoded, log);
+        assert!(encoded.as_ptr_range().contains(&decoded.message.as_ptr()));
     }
-}
 
-impl TryFrom<GuestLogData> for Vec<u8> {
-    type Error = Error;
-    #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
-    fn try_from(value: GuestLogData) -> Result<Vec<u8>> {
-        (&value).try_into()
+    #[test]
+    fn rejects_unknown_level() {
+        let mut buffer = Vec::new();
+        let mut encoded = sample().encode(&mut buffer).unwrap().to_vec();
+        let level = 1 + "message".len() + 1 + "source".len();
+        assert_eq!(encoded[level], LogLevel::Warning as u8);
+        encoded[level] = LogLevel::None as u8 + 1;
+
+        assert!(GuestLogData::decode(&encoded).is_err());
     }
-}
 
-#[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
-fn convert_generated_option(field_name: &str, opt: Option<&str>) -> Result<String> {
-    opt.map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("Missing field: {}", field_name))
+    #[test]
+    fn rejects_trailing_bytes() {
+        let mut buffer = Vec::new();
+        let mut encoded = sample().encode(&mut buffer).unwrap().to_vec();
+        encoded.push(0);
+
+        assert!(GuestLogData::decode(&encoded).is_err());
+    }
 }

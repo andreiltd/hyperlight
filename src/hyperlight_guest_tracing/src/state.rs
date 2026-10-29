@@ -2,7 +2,7 @@
 // Copyright 2025 The Hyperlight Authors.
 extern crate alloc;
 
-use alloc::string::String;
+use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -131,10 +131,6 @@ impl GuestState {
         let (idn, id) = self.alloc_id();
 
         let md = attrs.metadata();
-        let name = String::from(md.name());
-        let target = String::from(md.target());
-
-        // Visit fields to collect them
         let mut fields = Vec::new();
         attrs.record(&mut FieldsVisitor { out: &mut fields });
 
@@ -144,13 +140,11 @@ impl GuestState {
         let event = GuestEvent::OpenSpan {
             id: idn,
             parent_id,
-            name,
-            target,
+            name: Cow::Borrowed(md.name()),
+            target: Cow::Borrowed(md.target()),
             tsc: invariant_tsc::read_tsc(),
             fields,
         };
-
-        // Serialize the event
         self.encoder.encode(&event);
 
         id
@@ -162,33 +156,27 @@ impl GuestState {
         let parent_id = stack.last().copied().unwrap_or(0);
 
         let md = event.metadata();
-        let name = String::from(md.name());
-
         let mut fields = Vec::new();
         event.record(&mut FieldsVisitor { out: &mut fields });
 
         let event = GuestEvent::LogEvent {
             parent_id,
-            name,
+            name: Cow::Borrowed(md.name()),
             tsc: invariant_tsc::read_tsc(),
             fields,
         };
-
-        // Serialize the event
         self.encoder.encode(&event);
     }
 
     /// Record new values for an existing span
     pub(crate) fn record(&mut self, s_id: &Id, values: &Record<'_>) {
-        let mut v = Vec::new();
-        values.record(&mut FieldsVisitor { out: &mut v });
+        let mut fields = Vec::new();
+        values.record(&mut FieldsVisitor { out: &mut fields });
 
         let event = GuestEvent::EditSpan {
             id: s_id.into_u64(),
-            fields: v,
+            fields,
         };
-
-        // Serialize the event
         self.encoder.encode(&event);
     }
 

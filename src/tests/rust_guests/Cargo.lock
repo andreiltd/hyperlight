@@ -213,16 +213,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
-name = "flatbuffers"
-version = "25.12.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
-dependencies = [
- "bitflags 2.13.1",
- "rustc_version",
-]
-
-[[package]]
 name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -248,7 +238,6 @@ dependencies = [
  "bytemuck",
  "bytes",
  "fixedbitset",
- "flatbuffers",
  "log",
  "postcard",
  "serde",
@@ -292,7 +281,6 @@ name = "hyperlight-guest"
 version = "0.19.0"
 dependencies = [
  "anyhow",
- "flatbuffers",
  "hyperlight-common",
  "hyperlight-guest-tracing",
  "itertools",
@@ -304,7 +292,6 @@ dependencies = [
 name = "hyperlight-guest-bin"
 version = "0.19.0"
 dependencies = [
- "flatbuffers",
  "hyperlight-common",
  "hyperlight-guest",
  "hyperlight-guest-macro",
@@ -566,15 +553,6 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
-
-[[package]]
-name = "rustc_version"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
-dependencies = [
- "semver",
-]
 
 [[package]]
 name = "scopeguard"

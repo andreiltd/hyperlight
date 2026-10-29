@@ -10,6 +10,7 @@ use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, Functi
 use hyperlight_common::flatbuffer_wrappers::function_types::{
     FunctionCallResult, ParameterValue, ReturnType, ReturnValue,
 };
+use hyperlight_common::flatbuffer_wrappers::guest_log_data::GuestLogData;
 use hyperlight_common::layout::scratch_transport_end_gva;
 use hyperlight_common::outb::OutBAction;
 use hyperlight_common::transport::{
@@ -404,8 +405,13 @@ impl GuestContext {
     /// # Errors
     ///
     /// Returns an error when the message cannot be framed or submitted.
-    pub fn emit_log(&mut self, log_data: &[u8]) -> Result<()> {
-        let message = EncodedMessage::new(MsgKind::Log, 0, log_data, ExternalValues::new())
+    pub fn emit_log(&mut self, log: &GuestLogData<'_>) -> Result<()> {
+        let mut buffer = Vec::new();
+
+        let control = log
+            .encode(&mut buffer)
+            .with_context(|| "failed to encode guest log")?;
+        let message = EncodedMessage::new(MsgKind::Log, 0, control, ExternalValues::new())
             .context("G2H message length overflow")?;
         self.send_g2h_oneshot(&message)
     }

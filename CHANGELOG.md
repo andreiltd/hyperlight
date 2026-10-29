@@ -5,7 +5,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Prerelease] - Unreleased
 
 ### Changed
-* **Breaking:** Encode function calls and results with [postcard](https://docs.rs/postcard) instead of FlatBuffers, which makes calls faster. Float values keep their exact bits, including `-0.0`. Add `control_len` to `MsgHeader`, which grows to 16 bytes. Guests must be rebuilt. Snapshot ABI 10: existing snapshots must be regenerated.
+* **Breaking:** Encode function calls, results, guest logs and guest trace events with [postcard](https://docs.rs/postcard) instead of FlatBuffers, which makes calls faster. Float values keep their exact bits, including `-0.0`. Add `control_len` to `MsgHeader`, which grows to 16 bytes. Change `GuestLogData` to borrow its strings. Guests must be rebuilt. Snapshot ABI 10: existing snapshots must be regenerated.
+
+### Removed
+* **Breaking:** Remove the `flatbuffers` dependency, the generated code, `src/schema` and the `flatc` Justfile recipes. This also removes the FlatBuffers conversions on the message types, `estimate_flatbuffer_capacity`, and the `HyperlightError` variants `InvalidFlatBuffer`, `FailedToGetValueFromParameter` and `VectorCapacityIncorrect`.
 
 ## [v0.19.0] - 2026-11-04
 

@@ -61,10 +61,10 @@ pub(crate) fn emit_guest_log(log_data: &GuestLogData) {
     // receive these events thanks to the `tracing` crate's `log` feature,
     // which forwards tracing events to the `log` facade when no subscriber
     // is set.
-    let source_file = log_data.source_file.as_str();
+    let source_file = log_data.source_file;
     let line = log_data.line;
-    let source = log_data.source.as_str();
-    let message = log_data.message.as_str();
+    let source = log_data.source;
+    let message = log_data.message;
 
     match &log_data.level {
         LogLevel::Error | LogLevel::Critical => {
@@ -345,15 +345,15 @@ mod tests {
     use super::{GuestLogData, emit_guest_log};
     use crate::testing::log_values::test_value_as_str;
 
-    fn new_guest_log_data(level: LogLevel) -> GuestLogData {
-        GuestLogData::new(
-            "test log".to_string(),
-            "test source".to_string(),
+    fn new_guest_log_data(level: LogLevel) -> GuestLogData<'static> {
+        GuestLogData {
+            message: "test log",
+            source: "test source",
             level,
-            "test caller".to_string(),
-            "test source file".to_string(),
-            123,
-        )
+            caller: "test caller",
+            source_file: "test source file",
+            line: 123,
+        }
     }
 
     // Verifies that guest log events are forwarded to a `log` logger when no
