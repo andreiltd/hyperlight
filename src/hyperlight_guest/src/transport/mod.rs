@@ -25,7 +25,8 @@ const INITIALIZED: u8 = 1;
 static INIT_STATE: AtomicU8 = AtomicU8::new(UNINITIALIZED);
 static GLOBAL_CONTEXT: SyncWrap<RefCell<Option<GuestContext>>> = SyncWrap(RefCell::new(None));
 
-struct SyncWrap<T>(T);
+/// A static's value, shared without synchronization.
+pub(crate) struct SyncWrap<T>(pub(crate) T);
 
 // SAFETY: Hyperlight guests have one vCPU and serialize guest entry.
 unsafe impl<T> Sync for SyncWrap<T> {}

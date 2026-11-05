@@ -5,12 +5,17 @@ use std::collections::BTreeSet;
 use std::path::Path;
 #[cfg(crashdump)]
 use std::path::PathBuf;
+use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread::{self, Thread};
 
 use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, FunctionCallType};
 use hyperlight_common::flatbuffer_wrappers::function_types::{
     ParameterValue, ReturnType, ReturnValue,
 };
+use hyperlight_common::stream::StatusFlags;
 use tracing::{Span, instrument};
 use tracing_core::LevelFilter;
 
@@ -19,8 +24,8 @@ use super::file_mapping::prepare_file_cow;
 use super::host_funcs::FunctionRegistry;
 use super::snapshot::{Snapshot, SnapshotOptions};
 use crate::func::{ParameterTuple, SupportedReturnType};
-use crate::hypervisor::InterruptHandle;
 use crate::hypervisor::hyperlight_vm::{HyperlightVm, HyperlightVmError};
+use crate::hypervisor::{CancelScope, InterruptHandle};
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags};
 use crate::mem::mgr::{ExecutionMode, SandboxMemoryManager};
 use crate::mem::shared_mem::{HostSharedMemory, SharedMemory as _};
@@ -128,6 +133,25 @@ impl SnapshotMemoryReader<'_> {
 /// walked first, ignoring duplicates. An error aborts the capture.
 pub type PtRootFinder =
     Box<dyn Fn(&SnapshotMemoryReader<'_>, &[u8], u64) -> Result<Vec<u64>> + Send>;
+
+/// Wakes the thread that runs a [`Sandbox::block_on`] drive.
+struct BlockOnWaker {
+    /// The thread that parks while the drive waits.
+    thread: Thread,
+    /// Set by each wake, so a future that consumes the thread's park token cannot lose a wake.
+    notified: AtomicBool,
+}
+
+impl Wake for BlockOnWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.notified.store(true, Ordering::Release);
+        self.thread.unpark();
+    }
+}
 
 fn normalize_page_table_roots(roots: Vec<u64>, active_root: u64) -> Vec<u64> {
     let mut seen = BTreeSet::from([active_root]);
@@ -402,6 +426,10 @@ impl Sandbox {
     /// conceptual tree of states. Calling this method again without changing the
     /// sandbox returns the same snapshot.
     ///
+    /// Capture fails with [`crate::HyperlightError::StreamsActive`] while cross-boundary streams
+    /// or guest tasks are live, including pending reader closes. This leaves the sandbox and
+    /// streams unchanged.
+    ///
     /// A snapshot holds at most 30 memory layers. A capture that changes memory adds
     /// one layer. A layer drops out once later changes replace all of its pages.
     /// Creating a snapshot fails when it would exceed this limit or finds no room
@@ -458,8 +486,8 @@ impl Sandbox {
     /// Like [`Self::snapshot`], with [`SnapshotOptions`] for how the
     /// snapshot restores. Default options take the same snapshot as
     /// [`Self::snapshot`]. The sandbox continues from the captured snapshot,
-    /// with its scratch size. It returns the same sandbox status errors as
-    /// [`Self::snapshot`].
+    /// with its scratch size. It has the same capture restrictions and status
+    /// errors as [`Self::snapshot`].
     ///
     /// # Examples
     ///
@@ -479,6 +507,14 @@ impl Sandbox {
     #[instrument(err(Debug), skip_all, parent = Span::current())]
     pub fn snapshot_with_options(&mut self, options: &SnapshotOptions) -> Result<Arc<Snapshot>> {
         self.check_ready()?;
+
+        // The guest runs nothing between turns, so its last STATUS is current.
+        let streams = &self.mem_mgr.mux;
+
+        if streams.has_live_streams() || streams.status().contains(StatusFlags::ACTIVE) {
+            return Err(HyperlightError::StreamsActive);
+        }
+
         // Unpacked in full so that a new option has to decide whether the
         // cached plain snapshot still answers it.
         let SnapshotOptions { scratch_size } = options;
@@ -590,6 +626,9 @@ impl Sandbox {
     }
 
     fn checkpoint_transport_for_snapshot(&mut self) -> Result<()> {
+        // Cancellation set before the checkpoint is ignored, as it is for a call.
+        self.vm.clear_cancel();
+
         self.with_guest_execution(|sbox| {
             sbox.mem_mgr.begin_snapshot_checkpoint()?;
             sbox.dispatch_guest_call_restricted()?;
@@ -625,6 +664,10 @@ impl Sandbox {
     }
 
     /// Restores the sandbox's memory to a previously captured snapshot state.
+    ///
+    /// Restore ends live cross-boundary streams. Writes to guest readers fail
+    /// with [`ReaderClosed`](hyperlight_common::stream::StreamError::ReaderClosed).
+    /// Readers from the guest reach EOF after their buffered bytes.
     ///
     /// The sandbox's registered host functions must be a superset of
     /// those required by the snapshot (matched by name and
@@ -1010,6 +1053,79 @@ impl Sandbox {
         })
     }
 
+    /// Run `work` on this thread, driving stream traffic and ready guest tasks while it waits.
+    ///
+    /// The drive enters the guest when host stream records are pending or the guest reports
+    /// ready tasks. Otherwise it parks the thread until `work` or a stream wakes it. It returns
+    /// once `work` completes, so other pending stream work waits for a later drive or call.
+    ///
+    /// A guest or transport failure ends the drive and converts into `E`. `work` may borrow
+    /// streams and buffers, and need not be `Send`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use hyperlight_host::Sandbox;
+    /// # use hyperlight_host::stream::StreamReader;
+    /// # fn example(sandbox: &mut Sandbox, mut reader: StreamReader<u8>) -> anyhow::Result<()> {
+    /// let mut buffer = [0; 4096];
+    /// let len = sandbox.block_on(async {
+    ///     Ok::<_, anyhow::Error>(reader.read(&mut buffer).await?)
+    /// })?;
+    /// # let _ = len;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn block_on<T, E, F>(&mut self, work: F) -> std::result::Result<T, E>
+    where
+        F: Future<Output = std::result::Result<T, E>>,
+        E: From<HyperlightError>,
+    {
+        self.drive(work)?
+    }
+
+    /// Poll `work` to completion, running progress turns while it waits.
+    #[instrument(err(Debug), skip_all, parent = Span::current())]
+    fn drive<F: Future>(&mut self, work: F) -> Result<F::Output> {
+        self.check_ready()?;
+
+        let wake = Arc::new(BlockOnWaker {
+            thread: thread::current(),
+            notified: AtomicBool::new(false),
+        });
+
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut cx = Context::from_waker(&waker);
+        let mut work = pin!(work);
+
+        let cancel = CancelScope::start(self.vm.interrupt_handle(), &waker);
+
+        loop {
+            wake.notified.swap(false, Ordering::Acquire);
+
+            if let Poll::Ready(output) = work.as_mut().poll(&mut cx) {
+                return Ok(output);
+            }
+
+            // The guest is not running, so the sandbox stays ready.
+            if cancel.is_requested() {
+                return Err(HyperlightError::ExecutionCanceledByHost());
+            }
+
+            let streams = &self.mem_mgr.mux;
+            let host_rdy = streams.poll_pending(&mut cx).is_ready();
+            let guest_rdy = streams.status().contains(StatusFlags::READY);
+
+            if host_rdy || guest_rdy {
+                self.run_progress_turn()?;
+            } else {
+                while !wake.notified.swap(false, Ordering::Acquire) {
+                    thread::park();
+                }
+            }
+        }
+    }
+
     /// Maps a region of host memory into the sandbox address space.
     ///
     /// The base address and length must meet platform alignment requirements
@@ -1140,6 +1256,12 @@ impl Sandbox {
         args: Vec<ParameterValue>,
     ) -> Result<ReturnValue> {
         self.check_ready()?;
+
+        // ===== KILL() TIMING POINT 1 =====
+        // Cancellation set before this reset is ignored for this call.
+        // Cancellation during request preparation must reach the VM.
+        self.vm.clear_cancel();
+
         self.with_guest_execution(|sbox| {
             sbox.transport_dirty = true;
 
@@ -1150,7 +1272,7 @@ impl Sandbox {
                 return_type,
             );
 
-            let cid = sbox.mem_mgr.write_guest_function_call(&fc)?;
+            let cid = sbox.mem_mgr.write_guest_function_call(fc)?;
             sbox.dispatch_guest_call()?;
 
             let guest_result = sbox.mem_mgr.read_h2g_result_from_g2h(cid)?.into_inner();
@@ -1173,11 +1295,23 @@ impl Sandbox {
         })
     }
 
+    /// Run one progress turn: flush host stream records, enter the guest to poll its ready tasks,
+    /// and apply the records and STATUS it sends.
+    fn run_progress_turn(&mut self) -> Result<()> {
+        self.check_ready()?;
+        self.snapshot = None;
+
+        self.with_guest_execution(|sbox| {
+            sbox.transport_dirty = true;
+            sbox.mem_mgr.flush_h2g_streams()?;
+            sbox.dispatch_guest_call()?;
+            sbox.mem_mgr.read_progress_from_g2h()
+        })
+    }
+
+    /// Run `op`, which enters the guest. Then clear partial abort bytes, and poison the sandbox
+    /// on a poisoning error. Callers clear cancellation, so a drive's turns share one scope.
     fn with_guest_execution<T>(&mut self, op: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        // ===== KILL() TIMING POINT 1 =====
-        // Cancellation set before this reset is ignored for this operation.
-        // Cancellation during request preparation must reach the VM.
-        self.vm.clear_cancel();
         let result = op(self);
         self.mem_mgr.abort_buffer.clear();
 
@@ -1449,14 +1583,24 @@ fn warn_on_layout_override(
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
-    use std::thread;
+    use std::task::{Context, Poll, Waker};
+    use std::{assert_matches, thread};
 
     use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, FunctionCallType};
-    use hyperlight_common::flatbuffer_wrappers::function_types::ParameterValue;
+    use hyperlight_common::flatbuffer_wrappers::function_types::{
+        FunctionCallResult, ParameterValue, ReturnValue,
+    };
     use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
     use hyperlight_common::func::{Bytes, SupportedReturnType};
+    use hyperlight_common::stream::{
+        self, DEFAULT_WINDOW, Mux, Side, StatusFlags, StreamError, StreamReader,
+    };
+    use hyperlight_common::transport::PendingMessage;
+    use hyperlight_common::virtq::Segments;
     use hyperlight_testing::sandbox_sizes::{
         LARGE_SCRATCH_SIZE, MEDIUM_SCRATCH_SIZE, SMALL_SCRATCH_SIZE,
     };
@@ -1493,6 +1637,37 @@ mod tests {
 
     fn scratch(scratch_size: usize) -> SnapshotOptions {
         SnapshotOptions::default().scratch_size(scratch_size)
+    }
+
+    /// Exercise reader transfers without entering the guest.
+    fn transfer_reader(from: &mut Mux, to: &mut Mux, reader: StreamReader<u8>) -> StreamReader<u8> {
+        let result = FunctionCallResult::new(Ok(ReturnValue::StreamReader(reader)));
+        let pending = PendingMessage::new_result(result, 1, from).unwrap();
+        let mut buffer = Vec::new();
+
+        let encoded = pending.encode(&mut buffer).unwrap();
+        let recv =
+            FunctionCallResult::decode(encoded.control(), &mut Segments::default(), to).unwrap();
+
+        pending.settle(Ok(())).unwrap();
+
+        StreamReader::from_value(recv.into_inner().unwrap()).unwrap()
+    }
+
+    /// Read the chunks `reader` holds without waiting. Returns the bytes and whether the stream
+    /// ended.
+    fn read_ready(reader: &mut StreamReader<u8>) -> (Vec<u8>, bool) {
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut bytes = Vec::new();
+
+        loop {
+            match pin!(reader.read_chunk()).poll(&mut cx) {
+                Poll::Ready(Ok(Some(chunk))) => bytes.extend_from_slice(&chunk),
+                Poll::Ready(Ok(None)) => return (bytes, true),
+                Poll::Ready(Err(error)) => panic!("stream failed: {error}"),
+                Poll::Pending => return (bytes, false),
+            }
+        }
     }
 
     fn assert_virtq_attached(sbox: &Sandbox) {
@@ -2193,6 +2368,236 @@ mod tests {
         assert!(!sandbox.transport_dirty);
     }
 
+    /// Cached capture must leave the reader held by the guest intact.
+    #[test]
+    fn cached_snapshots_reject_sent_readers() {
+        let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .scratch_size(8 << 20)
+            .build()
+            .unwrap();
+
+        sandbox.snapshot().unwrap();
+        let mut guest = Mux::new(Side::Guest, DEFAULT_WINDOW);
+        let (reader, mut writer) = stream::new();
+
+        let reader = transfer_reader(&mut sandbox.mem_mgr.mux, &mut guest, reader);
+        let generation = sandbox.mem_mgr.snapshot_count;
+
+        let error = sandbox.snapshot().err().unwrap();
+
+        assert_matches!(&error, HyperlightError::StreamsActive);
+
+        assert!(!error.is_poison_error());
+        assert_matches!(sandbox.status(), SandboxStatus::Ready);
+
+        assert!(!sandbox.transport_dirty);
+        assert_eq!(sandbox.mem_mgr.snapshot_count, generation);
+
+        assert!(sandbox.snapshot.is_some());
+        assert_eq!(sandbox.mem_mgr.layout.get_scratch_size(), 8 << 20);
+
+        let mut reader = transfer_reader(&mut guest, &mut sandbox.mem_mgr.mux, reader);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let mut bt = [0];
+        assert_matches!(pin!(writer.write(b"x")).poll(&mut cx), Poll::Ready(Ok(1)));
+        assert_matches!(pin!(reader.read(&mut bt)).poll(&mut cx), Poll::Ready(Ok(1)));
+
+        assert_eq!(&bt, b"x");
+        sandbox.snapshot().unwrap();
+    }
+
+    /// A dirty resize must reject incoming streams before entering the guest.
+    #[test]
+    fn dirty_resized_snapshots_reject_received_readers() {
+        let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .scratch_size(8 << 20)
+            .build()
+            .unwrap();
+
+        sandbox.snapshot().unwrap();
+        let mut guest = Mux::new(Side::Guest, DEFAULT_WINDOW);
+        let (reader, mut writer) = stream::new();
+        let reader = transfer_reader(&mut guest, &mut sandbox.mem_mgr.mux, reader);
+
+        sandbox.call::<i32>("AddToStatic", 1i32).unwrap();
+        let generation = sandbox.mem_mgr.snapshot_count;
+
+        let error = sandbox
+            .snapshot_with_options(&scratch(4 << 20))
+            .err()
+            .unwrap();
+
+        assert_matches!(&error, HyperlightError::StreamsActive);
+
+        assert!(!error.is_poison_error());
+        assert_matches!(sandbox.status(), SandboxStatus::Ready);
+
+        assert!(sandbox.transport_dirty);
+        assert_eq!(sandbox.mem_mgr.snapshot_count, generation);
+
+        assert!(sandbox.snapshot.is_none());
+        assert_eq!(sandbox.mem_mgr.layout.get_scratch_size(), 8 << 20);
+
+        let mut reader = transfer_reader(&mut sandbox.mem_mgr.mux, &mut guest, reader);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let mut bt = [0];
+        assert_matches!(pin!(writer.write(b"x")).poll(&mut cx), Poll::Ready(Ok(1)));
+        assert_matches!(pin!(reader.read(&mut bt)).poll(&mut cx), Poll::Ready(Ok(1)));
+
+        assert_eq!(&bt, b"x");
+        sandbox.snapshot().unwrap();
+    }
+
+    /// A guest task with no stream at the host blocks capture through the guest's STATUS.
+    #[test]
+    fn snapshots_reject_guest_tasks() {
+        let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .build()
+            .unwrap();
+
+        sandbox.call::<()>("StartLocalTask", ()).unwrap();
+
+        assert!(!sandbox.mem_mgr.mux.has_live_streams());
+        assert_eq!(sandbox.mem_mgr.mux.status(), StatusFlags::ACTIVE);
+
+        let error = sandbox.snapshot().err().unwrap();
+
+        assert_matches!(&error, HyperlightError::StreamsActive);
+
+        assert!(!error.is_poison_error());
+        assert_matches!(sandbox.status(), SandboxStatus::Ready);
+
+        // The gate returns before the checkpoint enters the guest.
+        assert!(sandbox.transport_dirty);
+
+        sandbox.call::<()>("StopLocalTask", ()).unwrap();
+
+        assert_eq!(sandbox.mem_mgr.mux.status(), StatusFlags::empty());
+        sandbox.snapshot().unwrap();
+    }
+
+    /// Held endpoints must observe session teardown when an older snapshot is restored.
+    #[test]
+    fn restore_closes_live_streams() {
+        let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .build()
+            .unwrap();
+
+        let snapshot = sandbox.snapshot().unwrap();
+        let mut guest = Mux::new(Side::Guest, DEFAULT_WINDOW);
+
+        let (reader, mut writer) = stream::new();
+        let _guest_reader = transfer_reader(&mut sandbox.mem_mgr.mux, &mut guest, reader);
+        let (reader, _guest_writer) = stream::new();
+
+        let mut reader = transfer_reader(&mut guest, &mut sandbox.mem_mgr.mux, reader);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let mut bt = [0];
+        assert_matches!(pin!(writer.write(b"x")).poll(&mut cx), Poll::Ready(Ok(1)));
+        assert_matches!(pin!(reader.read(&mut bt)).poll(&mut cx), Poll::Pending);
+
+        sandbox.restore(snapshot).unwrap();
+
+        assert_matches!(
+            pin!(writer.write(b"x")).poll(&mut cx),
+            Poll::Ready(Err(StreamError::ReaderClosed))
+        );
+        assert_matches!(pin!(reader.read(&mut bt)).poll(&mut cx), Poll::Ready(Ok(0)));
+        sandbox.snapshot().unwrap();
+    }
+
+    /// Held endpoints must observe session teardown when the sandbox is recreated.
+    #[test]
+    fn recreate_closes_live_streams() {
+        let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .build()
+            .unwrap();
+
+        let snapshot = sandbox.snapshot().unwrap();
+        let mut guest = Mux::new(Side::Guest, DEFAULT_WINDOW);
+
+        let (reader, mut writer) = stream::new();
+        let _guest_reader = transfer_reader(&mut sandbox.mem_mgr.mux, &mut guest, reader);
+        let (reader, _guest_writer) = stream::new();
+
+        let mut reader = transfer_reader(&mut guest, &mut sandbox.mem_mgr.mux, reader);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        sandbox.recreate(snapshot).unwrap();
+
+        let mut bt = [0];
+        assert_matches!(
+            pin!(writer.write(b"x")).poll(&mut cx),
+            Poll::Ready(Err(StreamError::ReaderClosed))
+        );
+        assert_matches!(pin!(reader.read(&mut bt)).poll(&mut cx), Poll::Ready(Ok(0)));
+        sandbox.snapshot().unwrap();
+    }
+
+    /// A progress turn sends the records a full G2H queue left pending. Its STATUS waits for the
+    /// host to drain the queue.
+    #[test]
+    fn progress_turn_flushes_records_left_pending() {
+        let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .g2h_queue_size(2)
+            .g2h_buffer_size(4096)
+            .build()
+            .unwrap();
+
+        let data: Vec<u8> = (0..6000).map(|i| (i % 251) as u8).collect();
+        let mut reader: StreamReader<u8> =
+            sandbox.call("StreamBytes", (data.clone(), false)).unwrap();
+
+        // The Response and STATUS fill the queue, so the call sends no DATA.
+        assert_eq!(read_ready(&mut reader), (Vec::new(), false));
+        let status = StatusFlags::READY | StatusFlags::ACTIVE;
+        assert_eq!(sandbox.mem_mgr.mux.status(), status);
+
+        // Two Stream messages fill the queue, so STATUS waits for the host to drain it.
+        sandbox.run_progress_turn().unwrap();
+
+        assert_eq!(read_ready(&mut reader), (data, true));
+        assert_eq!(sandbox.mem_mgr.mux.status(), StatusFlags::ACTIVE);
+    }
+
+    /// CREDIT resumes a guest producer in a progress turn, and CLOSE_READER releases its stream.
+    #[test]
+    fn progress_turns_resume_and_release_a_guest_producer() {
+        let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .build()
+            .unwrap();
+
+        let window = DEFAULT_WINDOW.get() as usize;
+        let pattern: Vec<u8> = (0..2 * window).map(|i| (i % 251) as u8).collect();
+        let mut reader: StreamReader<u8> =
+            sandbox.call("StreamPattern", pattern.len() as u32).unwrap();
+
+        // The producer waits for CREDIT after the first window.
+        let (mut received, ended) = read_ready(&mut reader);
+        assert!(!ended);
+        assert_eq!(received.len(), window);
+        assert_eq!(sandbox.mem_mgr.mux.status(), StatusFlags::ACTIVE);
+
+        // The producer writes the second window and finishes. The stream keeps STATUS ACTIVE.
+        sandbox.run_progress_turn().unwrap();
+
+        let (rest, ended) = read_ready(&mut reader);
+        received.extend(rest);
+        assert!(ended);
+        assert_eq!(received, pattern);
+        assert_eq!(sandbox.mem_mgr.mux.status(), StatusFlags::ACTIVE);
+
+        drop(reader);
+        sandbox.run_progress_turn().unwrap();
+
+        assert_eq!(sandbox.mem_mgr.mux.status(), StatusFlags::empty());
+        assert!(!sandbox.mem_mgr.mux.has_live_streams());
+        sandbox.snapshot().unwrap();
+    }
+
     #[test]
     fn snapshots_reject_noncanonical_transport_after_checkpoint() {
         let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
@@ -2271,7 +2676,7 @@ mod tests {
             FunctionCallType::Guest,
             i32::TYPE,
         );
-        sandbox.mem_mgr.write_guest_function_call(&call).unwrap();
+        sandbox.mem_mgr.write_guest_function_call(call).unwrap();
 
         let error = sandbox.dispatch_guest_call_restricted().unwrap_err();
 
@@ -2281,6 +2686,68 @@ mod tests {
         );
         assert_eq!(sandbox.status(), SandboxStatus::Poisoned);
         assert_eq!(sandbox.mem_mgr.execution_mode, ExecutionMode::Unrestricted);
+    }
+
+    /// A checkpoint with a live guest task aborts the guest. Restore recovers the sandbox.
+    #[test]
+    fn checkpoints_reject_guest_tasks() {
+        let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .build()
+            .unwrap();
+
+        let snapshot = sandbox.snapshot().unwrap();
+        sandbox.call::<()>("StartLocalTask", ()).unwrap();
+
+        let error = sandbox.checkpoint_transport_for_snapshot().unwrap_err();
+
+        assert_matches!(
+            &error,
+            HyperlightError::GuestAborted(_, message) if message.contains("live tasks or streams")
+        );
+        assert_eq!(sandbox.status(), SandboxStatus::Poisoned);
+
+        // The restored guest has no task.
+        sandbox.restore(snapshot).unwrap();
+        sandbox.call::<i32>("EchoI32", 7).unwrap();
+        sandbox.snapshot().unwrap();
+    }
+
+    /// A checkpoint with a live guest stream aborts the guest.
+    #[test]
+    fn checkpoints_reject_guest_streams() {
+        let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .build()
+            .unwrap();
+
+        // The producer finishes in the call turn. The guest keeps its send stream.
+        let _reader: StreamReader<u8> = sandbox.call("StreamBytes", (vec![7u8], false)).unwrap();
+
+        let error = sandbox.checkpoint_transport_for_snapshot().unwrap_err();
+
+        assert_matches!(
+            &error,
+            HyperlightError::GuestAborted(_, message) if message.contains("live tasks or streams")
+        );
+        assert_eq!(sandbox.status(), SandboxStatus::Poisoned);
+    }
+
+    /// A checkpoint followed by another H2G message aborts the guest.
+    #[test]
+    fn checkpoints_must_arrive_alone() {
+        let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .build()
+            .unwrap();
+
+        sandbox.mem_mgr.begin_snapshot_checkpoint().unwrap();
+        sandbox.mem_mgr.begin_snapshot_checkpoint().unwrap();
+
+        let error = sandbox.dispatch_guest_call_restricted().unwrap_err();
+
+        assert_matches!(
+            &error,
+            HyperlightError::GuestAborted(_, m) if m.contains("Invalid checkpoint")
+        );
+        assert_eq!(sandbox.status(), SandboxStatus::Poisoned);
     }
 
     #[test]
@@ -2372,16 +2839,18 @@ mod tests {
         let mut clone =
             Sandbox::from_snapshot(snapshot, crate::HostFunctions::default(), None).unwrap();
         let expected = vec![0x3c; 3 * hyperlight_common::vmem::PAGE_SIZE + 117];
-        let call = FunctionCall::new(
-            "EchoGuestVecBytes".into(),
-            Some(vec![ParameterValue::VecBytes(expected.clone())]),
-            FunctionCallType::Guest,
-            Vec::<u8>::TYPE,
-        );
+        let call = || {
+            FunctionCall::new(
+                "EchoGuestVecBytes".into(),
+                Some(vec![ParameterValue::VecBytes(expected.clone())]),
+                FunctionCallType::Guest,
+                Vec::<u8>::TYPE,
+            )
+        };
 
         for restored in [&mut sandbox, &mut clone] {
             restored.transport_dirty = true;
-            let cid = restored.mem_mgr.write_guest_function_call(&call).unwrap();
+            let cid = restored.mem_mgr.write_guest_function_call(call()).unwrap();
             restored.dispatch_guest_call().unwrap();
             let value = restored
                 .mem_mgr

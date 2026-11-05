@@ -70,6 +70,16 @@ pub(crate) fn call_guest_function(function_call: FunctionCall) -> Result<ReturnV
     }
 }
 
+/// How a dispatch ends its turn.
+enum DispatchOutcome {
+    /// Send the guest function's result.
+    Result(u32, FunctionCallResult),
+    /// Flush stream records and publish STATUS.
+    Progress,
+    /// Prepare transport state for snapshot capture.
+    Checkpoint,
+}
+
 pub(crate) fn internal_dispatch_function() {
     transport::maybe_refresh();
     crate::refresh_guest_log_level();
@@ -89,16 +99,28 @@ pub(crate) fn internal_dispatch_function() {
     let dispatch = transport::with_ctx(|ctx| ctx.recv_h2g_dispatch())
         .expect("H2G dispatch deserialization failed");
 
-    let result = match dispatch {
+    let outcome = match dispatch {
         DispatchAction::Call(cid, fc) => {
             // Reseed the libc PRNG if requested by the host.
             #[cfg(feature = "libc")]
             crate::refresh_libc_rng();
 
             let res = call_guest_function(fc).map_err(|err| GuestError::new(err.kind, err.message));
-            Some((cid, FunctionCallResult::new(res)))
+
+            // Tasks run before the Response, so a returned stream's first window shares its halt.
+            hyperlight_guest::task::run_ready();
+
+            DispatchOutcome::Result(cid, FunctionCallResult::new(res))
         }
-        DispatchAction::SnapshotCheckpoint => None,
+        DispatchAction::Progress => {
+            // Tasks may use the libc PRNG after a restore.
+            #[cfg(feature = "libc")]
+            crate::refresh_libc_rng();
+
+            hyperlight_guest::task::run_ready();
+            DispatchOutcome::Progress
+        }
+        DispatchAction::SnapshotCheckpoint => DispatchOutcome::Checkpoint,
     };
 
     // All this tracing logic shall be done right before the call to `hlt` which is done after this
@@ -120,12 +142,16 @@ pub(crate) fn internal_dispatch_function() {
         hyperlight_guest_tracing::flush();
     }
 
-    match result {
-        Some((cid, result)) => transport::with_ctx(|ctx| {
+    match outcome {
+        DispatchOutcome::Result(cid, result) => transport::with_ctx(|ctx| {
             ctx.send_h2g_result(cid, result)
                 .expect("Failed to send function call result");
         }),
-        None => {
+        DispatchOutcome::Progress => transport::with_ctx(|ctx| {
+            ctx.finish_progress_turn()
+                .expect("Failed to finish the progress turn");
+        }),
+        DispatchOutcome::Checkpoint => {
             // SAFETY: Host chain accesses are complete. The checkpoint protocol
             // keeps consumers stopped until the host resets them.
             unsafe { transport::prepare_snapshot() }
