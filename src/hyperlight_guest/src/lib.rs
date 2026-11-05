@@ -17,5 +17,7 @@ pub mod exit;
 pub mod layout;
 pub mod paging;
 pub mod prim_alloc;
+pub mod stream;
+pub mod task;
 pub mod transport;
 pub mod types;

@@ -70,6 +70,14 @@ pub(crate) fn call_guest_function(function_call: FunctionCall) -> Result<ReturnV
     }
 }
 
+/// How a dispatch ends its turn.
+enum DispatchOutcome {
+    /// Send the guest function's result.
+    Result(u32, FunctionCallResult),
+    /// Flush stream records and publish STATUS.
+    Progress,
+}
+
 pub(crate) fn internal_dispatch_function() {
     transport::maybe_refresh();
     crate::refresh_guest_log_level();
@@ -86,15 +94,31 @@ pub(crate) fn internal_dispatch_function() {
         tracing::span!(tracing::Level::INFO, "internal_dispatch_function").entered()
     });
 
-    let DispatchAction::Call(cid, call) = transport::with_ctx(|ctx| ctx.recv_h2g_dispatch())
+    let dispatch = transport::with_ctx(|ctx| ctx.recv_h2g_dispatch())
         .expect("H2G dispatch deserialization failed");
 
-    // Reseed the libc PRNG if requested by the host.
-    #[cfg(feature = "libc")]
-    crate::refresh_libc_rng();
+    let outcome = match dispatch {
+        DispatchAction::Call(cid, fc) => {
+            // Reseed the libc PRNG if requested by the host.
+            #[cfg(feature = "libc")]
+            crate::refresh_libc_rng();
 
-    let result = call_guest_function(call).map_err(|err| GuestError::new(err.kind, err.message));
-    let result = FunctionCallResult::new(result);
+            let res = call_guest_function(fc).map_err(|err| GuestError::new(err.kind, err.message));
+
+            // Tasks run before the Response, so a returned stream's first window shares its halt.
+            hyperlight_guest::task::run_ready();
+
+            DispatchOutcome::Result(cid, FunctionCallResult::new(res))
+        }
+        DispatchAction::Progress => {
+            // Tasks may use the libc PRNG after a restore.
+            #[cfg(feature = "libc")]
+            crate::refresh_libc_rng();
+
+            hyperlight_guest::task::run_ready();
+            DispatchOutcome::Progress
+        }
+    };
 
     // All this tracing logic shall be done right before the call to `hlt` which is done after this
     // function returns
@@ -115,8 +139,14 @@ pub(crate) fn internal_dispatch_function() {
         hyperlight_guest_tracing::flush();
     }
 
-    transport::with_ctx(|ctx| {
-        ctx.send_h2g_result(cid, result)
-            .expect("Failed to send function call result");
-    });
+    match outcome {
+        DispatchOutcome::Result(cid, result) => transport::with_ctx(|ctx| {
+            ctx.send_h2g_result(cid, result)
+                .expect("Failed to send function call result");
+        }),
+        DispatchOutcome::Progress => transport::with_ctx(|ctx| {
+            ctx.finish_progress_turn()
+                .expect("Failed to finish the progress turn");
+        }),
+    }
 }

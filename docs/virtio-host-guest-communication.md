@@ -218,6 +218,9 @@ Decoding rejects trailing bytes. External bytes follow it in the same logical
 message.
 A logical message may span several descriptors or several H2G receive buffers.
 
+A reader value carries its stream ID and consumed byte position inline.
+Returning a reader to its origin resumes at that position.
+
 The guest reads control data directly when it occupies one segment. It copies
 fragmented control data into one contiguous buffer. Host decoding always copies
 control data out of guest writable scratch.
@@ -236,8 +239,21 @@ limit on the value types.
 ### External byte values
 
 `VecBytes` and `ByteChunks` payloads stay outside the control data. It contains
-the total logical value length and whether the value is chunked. The encoder
-references the caller's byte slices directly.
+the total logical value length and whether the value is chunked.
+`PendingMessage` owns the original call or result until publication settles.
+Its `encode` method returns a complete `EncodedMessage` that borrows those bytes
+for publication and retries. `ExternalValues` collects the borrowed slices
+through `ExternalValueSink`.
+
+The transports own publication and reusable control buffers. `Mux` prepares
+outgoing work and applies incoming transfers and records. `PendingMessage::settle`
+commits the prepared stream changes after publication succeeds.
+
+Dropping an unpublished message closes transferred readers and leaves stream
+records pending. An uncertain publication fails the session. A failed decode
+closes the readers it received. A failed call decode also fails the session,
+since its later transfers stay unreceived. A host-function
+response settles after its reply chain is completed, which publishes the response.
 
 `ExternalValueSource` is implemented by `RecvChain` for host decoding and by
 `Segments` for guest decoding.
@@ -428,6 +444,11 @@ and pool bytes live in scratch. Capture prepares deterministic bootstrap images
 without reading the live rings. Retained aliases map live payload pages outside
 the scratch map, so capture copies them as ordinary memory.
 
+Capture fails with `HyperlightError::StreamsActive` while cross-boundary
+streams or guest tasks are live, including pending reader closes. It checks
+the host Mux and the guest's last STATUS. Snapshots cannot preserve the Mux
+state needed to resume streams.
+
 Capture requires a stopped VM with no unfinished guest calls or live host
 chain handles. It runs entirely on the host. An unchanged sandbox can reuse
 its cached snapshot. Building a fresh snapshot follows this flow:
@@ -471,6 +492,10 @@ Admitted images and their layout remain immutable.
 
 Transport admission precedes changes to sandbox status, the cached snapshot,
 and memory mappings.
+
+Restore starts a fresh host Mux and ends the current cross-boundary streams.
+Host writers fail with `ReaderClosed`. Host readers reach EOF after their
+buffered bytes.
 
 Restore writes the arena GPA metadata, an `InitComplete` mailbox value,
 and both ring images into fresh scratch. It attaches new host consumers at

@@ -65,6 +65,10 @@ pub mod sandbox;
 /// Signal handling for Linux
 #[cfg(target_os = "linux")]
 pub(crate) mod signal_handlers;
+/// Byte streams that cross the sandbox boundary.
+pub mod stream {
+    pub use hyperlight_common::stream::{StreamError, StreamReader, StreamWriter, new};
+}
 /// Utilities for testing including interacting with `simpleguest` testing guest binary
 #[cfg(test)]
 pub(crate) mod testing;
