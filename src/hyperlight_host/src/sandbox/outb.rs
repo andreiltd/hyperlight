@@ -9,7 +9,7 @@ use hyperlight_common::flatbuffer_wrappers::guest_error::{ErrorCode, GuestError}
 use hyperlight_common::flatbuffer_wrappers::guest_log_data::GuestLogData;
 use hyperlight_common::flatbuffer_wrappers::guest_log_level::LogLevel;
 use hyperlight_common::outb::{Exception, OutBAction};
-use hyperlight_common::transport::MsgKind;
+use hyperlight_common::transport::{MsgKind, PendingMessage};
 use hyperlight_common::virtq::ReplyChain;
 use tracing::{Span, instrument};
 
@@ -291,7 +291,7 @@ fn outb_virtq_call(
     })?;
 
     let call = message
-        .decode_call()
+        .decode_call(&mut mem_mgr.mux)
         .map_err(|error| HandleOutbError::ReadHostFunctionCall(error.to_string()))?;
 
     if call.function_call_type() != FunctionCallType::Host {
@@ -312,19 +312,38 @@ fn outb_virtq_call(
     let result = FunctionCallResult::new(result);
     let resp_capacity = resp.capacity();
 
+    let mut pending = PendingMessage::result(result, cid, &mut mem_mgr.mux)
+        .map_err(|err| HandleOutbError::WriteHostFunctionResponse(err.to_string()))?;
+
     // Capacity is checked before writing, so an oversized result leaves the
     // chain untouched and can be replaced with a bounded transport error.
-    if !virtq::try_write_response(&mut resp, cid, &result)
-        .map_err(|err| HandleOutbError::WriteHostFunctionResponse(err.to_string()))?
-    {
+    let published = {
+        let encoded = pending
+            .encode(&mut mem_mgr.encode_buffer)
+            .map_err(|err| HandleOutbError::WriteHostFunctionResponse(err.to_string()))?;
+
+        virtq::try_write_response(&mut resp, &encoded)
+            .map_err(|err| HandleOutbError::WriteHostFunctionResponse(err.to_string()))?
+    };
+
+    if !published {
+        drop(pending);
+
         let fallback = FunctionCallResult::new(Err(GuestError::new(
             ErrorCode::HostFunctionError,
             "Host response exceeds virtqueue capacity".into(),
         )));
 
+        pending = PendingMessage::result(fallback, cid, &mut mem_mgr.mux)
+            .map_err(|err| HandleOutbError::WriteHostFunctionResponse(err.to_string()))?;
+
+        let encoded = pending
+            .encode(&mut mem_mgr.encode_buffer)
+            .map_err(|err| HandleOutbError::WriteHostFunctionResponse(err.to_string()))?;
+
         // The guest must receive a response for this correlation id. Failure
         // to fit even this small error makes the transport unusable.
-        if !virtq::try_write_response(&mut resp, cid, &fallback)
+        if !virtq::try_write_response(&mut resp, &encoded)
             .map_err(|err| HandleOutbError::WriteHostFunctionResponse(err.to_string()))?
         {
             return Err(HandleOutbError::WriteHostFunctionResponse(format!(
@@ -333,8 +352,8 @@ fn outb_virtq_call(
         }
     }
 
-    consumer
-        .complete(message.into_chain(), resp)
+    pending
+        .settle(consumer.complete(message.into_chain(), resp))
         .map_err(|err| HandleOutbError::WriteHostFunctionResponse(err.to_string()))?;
 
     Ok(())

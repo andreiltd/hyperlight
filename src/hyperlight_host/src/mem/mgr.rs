@@ -5,7 +5,8 @@ use hyperlight_common::flatbuffer_wrappers::function_call::FunctionCall;
 use hyperlight_common::flatbuffer_wrappers::function_types::FunctionCallResult;
 use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionDetails;
 use hyperlight_common::log_level::GuestLogFilter;
-use hyperlight_common::transport::{Buf, EncodedMessage, ExternalValues, MailboxValue, MsgKind};
+use hyperlight_common::stream::{DEFAULT_WINDOW, Mux, Side};
+use hyperlight_common::transport::{Buf, EncodedMessage, MailboxValue, MsgKind, PendingMessage};
 use hyperlight_common::virtq::ReplyChain;
 use hyperlight_common::vmem::{self, PAGE_TABLE_SIZE};
 #[cfg(crashdump)]
@@ -393,6 +394,10 @@ pub(crate) struct SandboxMemoryManager<S: SharedMemory> {
     pub(crate) g2h_consumer: Option<G2hConsumer>,
     /// H2G consumer bound to the current scratch mapping.
     pub(crate) h2g_consumer: Option<H2gConsumer>,
+    /// The stream session's Mux. Function calls and results move readers through it.
+    pub(crate) mux: Mux,
+    /// Reusable control storage for outgoing messages.
+    pub(crate) encode_buffer: Vec<u8>,
     /// Correlation ID sequence survives consumer replacement and manager cloning.
     next_guest_cid: u32,
 }
@@ -410,6 +415,8 @@ impl<S: Clone + SharedMemory> Clone for SandboxMemoryManager<S> {
             snapshot_count: self.snapshot_count,
             g2h_consumer: None,
             h2g_consumer: None,
+            mux: Mux::new(Side::Host, DEFAULT_WINDOW),
+            encode_buffer: Vec::new(),
             next_guest_cid: self.next_guest_cid,
         }
     }
@@ -556,6 +563,8 @@ where
             snapshot_count: 0,
             g2h_consumer: None,
             h2g_consumer: None,
+            mux: Mux::new(Side::Host, DEFAULT_WINDOW),
+            encode_buffer: Vec::new(),
             next_guest_cid: 1,
         }
     }
@@ -611,6 +620,8 @@ impl SandboxMemoryManager<ExclusiveSharedMemory> {
             snapshot_count: self.snapshot_count,
             g2h_consumer: None,
             h2g_consumer: None,
+            mux: self.mux,
+            encode_buffer: self.encode_buffer,
             next_guest_cid: self.next_guest_cid,
         };
         let guest_mgr = SandboxMemoryManager {
@@ -624,6 +635,8 @@ impl SandboxMemoryManager<ExclusiveSharedMemory> {
             snapshot_count: self.snapshot_count,
             g2h_consumer: None,
             h2g_consumer: None,
+            mux: Mux::new(Side::Host, DEFAULT_WINDOW),
+            encode_buffer: Vec::new(),
             next_guest_cid: self.next_guest_cid,
         };
         host_mgr.update_scratch_bookkeeping()?;
@@ -740,19 +753,25 @@ impl SandboxMemoryManager<HostSharedMemory> {
 
     /// Write a guest function call into the H2G virtqueue.
     #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
-    pub(crate) fn write_guest_function_call(&mut self, call: &FunctionCall) -> Result<u32> {
+    pub(crate) fn write_guest_function_call(&mut self, call: FunctionCall) -> Result<u32> {
         let cid = self.next_guest_cid;
+        let bufsz = self.layout.get_h2g_buffer_size();
 
-        let mut buffer = Vec::new();
-        let mut externals = ExternalValues::new();
+        let pending = PendingMessage::call(call, cid, &mut self.mux)?;
+        let encoded = pending.encode(&mut self.encode_buffer)?;
 
-        let control = call.encode(&mut buffer, &mut externals)?;
+        let res = Self::write_h2g_message(self.h2g_consumer.as_mut(), bufsz, &encoded);
+        if let Err(err) = res {
+            if err.is_poison_error() {
+                pending.fail();
+            }
 
-        let Some(msg) = EncodedMessage::new(MsgKind::Request, cid, control, externals) else {
-            return Err(new_error!("H2G request exceeds the wire payload limit"));
-        };
+            return Err(err);
+        }
 
-        self.write_h2g_message(&msg)?;
+        pending
+            .settle(Ok(()))
+            .map_err(|error| HyperlightError::TransportError(error.to_string()))?;
 
         self.next_guest_cid = cid.wrapping_add(1);
         if self.next_guest_cid == 0 {
@@ -762,12 +781,16 @@ impl SandboxMemoryManager<HostSharedMemory> {
         Ok(cid)
     }
 
-    fn write_h2g_message(&mut self, message: &EncodedMessage<'_>) -> Result<()> {
-        let consumer = self.h2g_consumer.as_mut().ok_or_else(|| {
+    /// Write `message` into posted H2G buffers of `buffer_size` bytes.
+    fn write_h2g_message(
+        consumer: Option<&mut H2gConsumer>,
+        buffer_size: usize,
+        message: &EncodedMessage<'_>,
+    ) -> Result<()> {
+        let consumer = consumer.ok_or_else(|| {
             HyperlightError::TransportError("H2G consumer is not attached".into())
         })?;
 
-        let buffer_size = self.layout.get_h2g_buffer_size();
         let buffer_count = message.total_len().div_ceil(buffer_size);
 
         // Keep a buffer for a control call that releases retained external bytes.
@@ -882,7 +905,7 @@ impl SandboxMemoryManager<HostSharedMemory> {
                         ));
                     }
 
-                    let result = message.decode_result();
+                    let result = message.decode_result(&mut self.mux);
                     consumer
                         .complete(message.into_chain(), reply)
                         .map_err(|err| {
@@ -915,7 +938,8 @@ impl SandboxMemoryManager<HostSharedMemory> {
         self.scratch_mem.copy_from_slice(cp, offset)?;
 
         let message = EncodedMessage::new_snapshot_cp();
-        self.write_h2g_message(&message)
+        let buffer_size = self.layout.get_h2g_buffer_size();
+        Self::write_h2g_message(self.h2g_consumer.as_mut(), buffer_size, &message)
     }
 
     /// Reset consumers and require the guest's completion status.
@@ -1046,6 +1070,7 @@ impl SandboxMemoryManager<HostSharedMemory> {
 
         self.g2h_consumer = None;
         self.h2g_consumer = None;
+        self.mux = Mux::new(Side::Host, DEFAULT_WINDOW);
         self.execution_mode = ExecutionMode::Unrestricted;
 
         // A panic during restricted dispatch can skip the mode reset.
@@ -1381,7 +1406,7 @@ mod tests {
             desc.len = len;
             case.set_h2g_desc(0, desc);
 
-            let error = mgr.write_guest_function_call(&h2g_call(0)).unwrap_err();
+            let error = mgr.write_guest_function_call(h2g_call(0)).unwrap_err();
 
             assert!(error.to_string().contains(expected), "{error:#}");
             assert!(error.is_poison_error());
@@ -1399,7 +1424,7 @@ mod tests {
         case.set_h2g_desc(1, desc);
 
         let error = mgr
-            .write_guest_function_call(&h2g_call(H2G_BUFFER_SIZE + 1024))
+            .write_guest_function_call(h2g_call(H2G_BUFFER_SIZE + 1024))
             .unwrap_err();
 
         assert!(error.to_string().contains("Memory write"), "{error:#}");
@@ -1415,13 +1440,13 @@ mod tests {
         let cursor = mgr.h2g_consumer.as_ref().unwrap().avail_cursor();
 
         let error = mgr
-            .write_guest_function_call(&h2g_call(H2G_BUFFER_SIZE * 4))
+            .write_guest_function_call(h2g_call(H2G_BUFFER_SIZE * 4))
             .unwrap_err();
 
         assert!(error.to_string().contains("H2G capacity"), "{error:#}");
         assert!(!error.is_poison_error());
         assert_eq!(mgr.h2g_consumer.as_ref().unwrap().avail_cursor(), cursor);
-        assert_eq!(mgr.write_guest_function_call(&h2g_call(0)).unwrap(), 1);
+        assert_eq!(mgr.write_guest_function_call(h2g_call(0)).unwrap(), 1);
     }
 
     #[test]
@@ -1451,7 +1476,7 @@ mod tests {
         let buffers: Vec<_> = (0..4).map(|index| case.h2g_desc(index).addr).collect();
 
         let cid = mgr
-            .write_guest_function_call(&h2g_call(external_len))
+            .write_guest_function_call(h2g_call(external_len))
             .unwrap();
 
         let used = mgr.h2g_consumer.as_ref().unwrap().avail_cursor().head();
@@ -1468,11 +1493,11 @@ mod tests {
         assert_eq!(external, vec![0xa5; external_len]);
 
         let cursor = mgr.h2g_consumer.as_ref().unwrap().avail_cursor();
-        let error = mgr.write_guest_function_call(&h2g_call(1)).unwrap_err();
+        let error = mgr.write_guest_function_call(h2g_call(1)).unwrap_err();
 
         assert!(error.to_string().contains("H2G capacity"), "{error:#}");
         assert_eq!(mgr.h2g_consumer.as_ref().unwrap().avail_cursor(), cursor);
-        assert_eq!(mgr.write_guest_function_call(&h2g_call(0)).unwrap(), 2);
+        assert_eq!(mgr.write_guest_function_call(h2g_call(0)).unwrap(), 2);
     }
 
     #[test]
@@ -1554,10 +1579,10 @@ mod tests {
         mgr.next_guest_cid = u32::MAX;
 
         assert_eq!(
-            mgr.write_guest_function_call(&h2g_call(0)).unwrap(),
+            mgr.write_guest_function_call(h2g_call(0)).unwrap(),
             u32::MAX
         );
-        assert_eq!(mgr.write_guest_function_call(&h2g_call(0)).unwrap(), 1);
+        assert_eq!(mgr.write_guest_function_call(h2g_call(0)).unwrap(), 1);
     }
 
     #[test]
@@ -1565,7 +1590,7 @@ mod tests {
         let case = TestCase::new();
         let mut mgr = manager(&case);
         mgr.g2h_consumer = Some(case.g2h_consumer());
-        mgr.write_guest_function_call(&h2g_call(0)).unwrap();
+        mgr.write_guest_function_call(h2g_call(0)).unwrap();
 
         let cloned = mgr.clone();
 
@@ -1582,13 +1607,13 @@ mod tests {
         let mut mgr = manager(&case);
         mgr.g2h_consumer = Some(case.g2h_consumer());
         let captured = VirtqSnapshot::capture(&mgr.layout, &mgr.scratch_mem).unwrap();
-        assert_eq!(mgr.write_guest_function_call(&h2g_call(0)).unwrap(), 1);
+        assert_eq!(mgr.write_guest_function_call(h2g_call(0)).unwrap(), 1);
 
         mgr.g2h_consumer = None;
         mgr.h2g_consumer = None;
         mgr.restore_virtq(&captured).unwrap();
 
-        assert_eq!(mgr.write_guest_function_call(&h2g_call(0)).unwrap(), 2);
+        assert_eq!(mgr.write_guest_function_call(h2g_call(0)).unwrap(), 2);
     }
 
     /// Build a snapshot for the given configuration and verify the

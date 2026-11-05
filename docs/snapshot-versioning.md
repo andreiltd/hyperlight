@@ -86,8 +86,9 @@ Compile-time tripwires in
 [src/hyperlight_host/src/sandbox/snapshot/tripwires.rs](../src/hyperlight_host/src/sandbox/snapshot/tripwires.rs)
 hold a copy of every value that defines the format:
 `SNAPSHOT_ABI_VERSION`, the snapshot and config media-type strings, the
-OCI layout version, the `HyperlightPEB` size, every `OutBAction` and
-`VmAction` discriminant, and `BASE_ADDRESS`. If the source value
+OCI layout version, the `HyperlightPEB` size, every `OutBAction`,
+`VmAction` and `MsgKind` discriminant, `BASE_ADDRESS`, the STATUS
+flags, `MAX_STREAMS` and `MAX_TRANSFERS`. If the source value
 drifts from the copy in `tripwires.rs`, the crate fails to compile.
 
 Wire format tests in

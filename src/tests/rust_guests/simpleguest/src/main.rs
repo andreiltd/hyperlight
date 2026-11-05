@@ -1820,11 +1820,11 @@ fn dispatch(function_call: FunctionCall) -> Result<ReturnValue> {
 
     let result = call_host_function::<i32>(
         "HostPrint",
-        Some(Vec::from(&[ParameterValue::String(message.to_string())])),
+        Some(vec![ParameterValue::String(message.to_string())]),
         ReturnType::Int,
     )?;
     let function_name = function_call.function_name.clone();
-    let param_len = function_call.parameters.clone().unwrap_or_default().len();
+    let param_len = function_call.parameters.as_ref().map_or(0, Vec::len);
     let call_type = function_call.function_call_type().clone();
 
     if function_name != "ThisIsNotARealFunctionButTheNameIsImportant"

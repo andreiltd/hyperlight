@@ -9,6 +9,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 * **Breaking:** Encode function calls with serde/postcard instead of FlatBuffers.
+* **Breaking:** Function calls, results and their values are not `Clone`, since a value can hold a stream reader. `SupportedParameterType`, `SupportedReturnType` and `ParameterTuple` do not require `Clone`. `ParameterType`, `ParameterValue`, `ReturnType` and `ReturnValue` have `StreamReader` variants.
+* **Breaking:** Encode function calls and results through `transport::PendingMessage`, which owns their values until publication settles. `FunctionCall::decode` and `FunctionCallResult::decode` take `streams: &mut Mux` as their last argument.
+* `Sandbox::snapshot` and `snapshot_with_options` reject live cross-boundary streams without changing the sandbox.
 
 ### Fixed
 * Fix restore on WHP not rewinding the guest TSC on hosts with `TSC_ADJUST` support.

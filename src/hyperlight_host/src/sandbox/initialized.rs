@@ -404,6 +404,9 @@ impl Sandbox {
     /// conceptual tree of states. Calling this method again without changing the
     /// sandbox returns the same snapshot.
     ///
+    /// Capture fails while cross-boundary streams are live, including pending
+    /// reader closes. This leaves the sandbox and streams unchanged.
+    ///
     /// A snapshot holds at most 30 memory layers. A capture that changes memory adds
     /// one layer. A layer drops out once later changes replace all of its pages.
     /// Creating a snapshot fails when it would exceed this limit or finds no room
@@ -460,8 +463,8 @@ impl Sandbox {
     /// Like [`Self::snapshot`], with [`SnapshotOptions`] for how the
     /// snapshot restores. Default options take the same snapshot as
     /// [`Self::snapshot`]. The sandbox continues from the captured snapshot,
-    /// with its scratch size. It returns the same sandbox status errors as
-    /// [`Self::snapshot`].
+    /// with its scratch size. It has the same capture restrictions and status
+    /// errors as [`Self::snapshot`].
     ///
     /// # Examples
     ///
@@ -481,6 +484,13 @@ impl Sandbox {
     #[instrument(err(Debug), skip_all, parent = Span::current())]
     pub fn snapshot_with_options(&mut self, options: &SnapshotOptions) -> Result<Arc<Snapshot>> {
         self.check_ready()?;
+
+        if self.mem_mgr.mux.has_live_streams() {
+            return Err(crate::new_error!(
+                "cannot snapshot live cross-boundary streams"
+            ));
+        }
+
         // Unpacked in full so that a new option has to decide whether the
         // cached plain snapshot still answers it.
         let SnapshotOptions { scratch_size } = options;
@@ -627,6 +637,10 @@ impl Sandbox {
     }
 
     /// Restores the sandbox's memory to a previously captured snapshot state.
+    ///
+    /// Restore ends live cross-boundary streams. Writes to guest readers fail
+    /// with [`ReaderClosed`](hyperlight_common::stream::StreamError::ReaderClosed).
+    /// Readers from the guest reach EOF after their buffered bytes.
     ///
     /// The sandbox's registered host functions must be a superset of
     /// those required by the snapshot (matched by name and
@@ -1152,7 +1166,7 @@ impl Sandbox {
                 return_type,
             );
 
-            let cid = sbox.mem_mgr.write_guest_function_call(&fc)?;
+            let cid = sbox.mem_mgr.write_guest_function_call(fc)?;
             sbox.dispatch_guest_call()?;
 
             let guest_result = sbox.mem_mgr.read_h2g_result_from_g2h(cid)?.into_inner();
@@ -1451,14 +1465,22 @@ fn warn_on_layout_override(
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
-    use std::thread;
+    use std::task::{Context, Poll, Waker};
+    use std::{assert_matches, thread};
 
     use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, FunctionCallType};
-    use hyperlight_common::flatbuffer_wrappers::function_types::ParameterValue;
+    use hyperlight_common::flatbuffer_wrappers::function_types::{
+        FunctionCallResult, ParameterValue, ReturnValue,
+    };
     use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
     use hyperlight_common::func::{Bytes, SupportedReturnType};
+    use hyperlight_common::stream::{self, DEFAULT_WINDOW, Mux, Side, StreamError, StreamReader};
+    use hyperlight_common::transport::PendingMessage;
+    use hyperlight_common::virtq::Segments;
     use hyperlight_testing::sandbox_sizes::{
         LARGE_SCRATCH_SIZE, MEDIUM_SCRATCH_SIZE, SMALL_SCRATCH_SIZE,
     };
@@ -1496,6 +1518,21 @@ mod tests {
 
     fn scratch(scratch_size: usize) -> SnapshotOptions {
         SnapshotOptions::default().scratch_size(scratch_size)
+    }
+
+    /// Exercise reader transfers without entering the guest.
+    fn transfer_reader(from: &mut Mux, to: &mut Mux, reader: StreamReader<u8>) -> StreamReader<u8> {
+        let result = FunctionCallResult::new(Ok(ReturnValue::StreamReader(reader)));
+        let pending = PendingMessage::result(result, 1, from).unwrap();
+        let mut buffer = Vec::new();
+
+        let encoded = pending.encode(&mut buffer).unwrap();
+        let recv =
+            FunctionCallResult::decode(encoded.control(), &mut Segments::default(), to).unwrap();
+
+        pending.settle(Ok(())).unwrap();
+
+        StreamReader::from_value(recv.into_inner().unwrap()).unwrap()
     }
 
     fn assert_virtq_attached(sbox: &Sandbox) {
@@ -2197,6 +2234,153 @@ mod tests {
         assert!(!sandbox.transport_dirty);
     }
 
+    /// Cached capture must leave the reader held by the guest intact.
+    #[test]
+    fn cached_snapshots_reject_sent_readers() {
+        let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .scratch_size(8 << 20)
+            .build()
+            .unwrap();
+
+        sandbox.snapshot().unwrap();
+        let mut guest = Mux::new(Side::Guest, DEFAULT_WINDOW);
+        let (reader, mut writer) = stream::new();
+
+        let reader = transfer_reader(&mut sandbox.mem_mgr.mux, &mut guest, reader);
+        let generation = sandbox.mem_mgr.snapshot_count;
+
+        let error = sandbox.snapshot().err().unwrap();
+
+        assert_matches!(
+            &error,
+            HyperlightError::Error(message) if message.contains("live cross-boundary streams")
+        );
+
+        assert!(!error.is_poison_error());
+        assert_matches!(sandbox.status(), SandboxStatus::Ready);
+
+        assert!(!sandbox.transport_dirty);
+        assert_eq!(sandbox.mem_mgr.snapshot_count, generation);
+
+        assert!(sandbox.snapshot.is_some());
+        assert_eq!(sandbox.mem_mgr.layout.get_scratch_size(), 8 << 20);
+
+        let mut reader = transfer_reader(&mut guest, &mut sandbox.mem_mgr.mux, reader);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let mut bt = [0];
+        assert_matches!(pin!(writer.write(b"x")).poll(&mut cx), Poll::Ready(Ok(1)));
+        assert_matches!(pin!(reader.read(&mut bt)).poll(&mut cx), Poll::Ready(Ok(1)));
+
+        assert_eq!(&bt, b"x");
+        sandbox.snapshot().unwrap();
+    }
+
+    /// A dirty resize must reject incoming streams before entering the guest.
+    #[test]
+    fn dirty_resized_snapshots_reject_received_readers() {
+        let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .scratch_size(8 << 20)
+            .build()
+            .unwrap();
+
+        sandbox.snapshot().unwrap();
+        let mut guest = Mux::new(Side::Guest, DEFAULT_WINDOW);
+        let (reader, mut writer) = stream::new();
+        let reader = transfer_reader(&mut guest, &mut sandbox.mem_mgr.mux, reader);
+
+        sandbox.call::<i32>("AddToStatic", 1i32).unwrap();
+        let generation = sandbox.mem_mgr.snapshot_count;
+
+        let error = sandbox
+            .snapshot_with_options(&scratch(4 << 20))
+            .err()
+            .unwrap();
+
+        assert_matches!(
+            &error,
+            HyperlightError::Error(message) if message.contains("live cross-boundary streams")
+        );
+
+        assert!(!error.is_poison_error());
+        assert_matches!(sandbox.status(), SandboxStatus::Ready);
+
+        assert!(sandbox.transport_dirty);
+        assert_eq!(sandbox.mem_mgr.snapshot_count, generation);
+
+        assert!(sandbox.snapshot.is_none());
+        assert_eq!(sandbox.mem_mgr.layout.get_scratch_size(), 8 << 20);
+
+        let mut reader = transfer_reader(&mut sandbox.mem_mgr.mux, &mut guest, reader);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let mut bt = [0];
+        assert_matches!(pin!(writer.write(b"x")).poll(&mut cx), Poll::Ready(Ok(1)));
+        assert_matches!(pin!(reader.read(&mut bt)).poll(&mut cx), Poll::Ready(Ok(1)));
+
+        assert_eq!(&bt, b"x");
+        sandbox.snapshot().unwrap();
+    }
+
+    /// Held endpoints must observe session teardown when an older snapshot is restored.
+    #[test]
+    fn restore_closes_live_streams() {
+        let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .build()
+            .unwrap();
+
+        let snapshot = sandbox.snapshot().unwrap();
+        let mut guest = Mux::new(Side::Guest, DEFAULT_WINDOW);
+
+        let (reader, mut writer) = stream::new();
+        let _guest_reader = transfer_reader(&mut sandbox.mem_mgr.mux, &mut guest, reader);
+        let (reader, _guest_writer) = stream::new();
+
+        let mut reader = transfer_reader(&mut guest, &mut sandbox.mem_mgr.mux, reader);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let mut bt = [0];
+        assert_matches!(pin!(writer.write(b"x")).poll(&mut cx), Poll::Ready(Ok(1)));
+        assert_matches!(pin!(reader.read(&mut bt)).poll(&mut cx), Poll::Pending);
+
+        sandbox.restore(snapshot).unwrap();
+
+        assert_matches!(
+            pin!(writer.write(b"x")).poll(&mut cx),
+            Poll::Ready(Err(StreamError::ReaderClosed))
+        );
+        assert_matches!(pin!(reader.read(&mut bt)).poll(&mut cx), Poll::Ready(Ok(0)));
+        sandbox.snapshot().unwrap();
+    }
+
+    /// Held endpoints must observe session teardown when the sandbox is recreated.
+    #[test]
+    fn recreate_closes_live_streams() {
+        let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .build()
+            .unwrap();
+
+        let snapshot = sandbox.snapshot().unwrap();
+        let mut guest = Mux::new(Side::Guest, DEFAULT_WINDOW);
+
+        let (reader, mut writer) = stream::new();
+        let _guest_reader = transfer_reader(&mut sandbox.mem_mgr.mux, &mut guest, reader);
+        let (reader, _guest_writer) = stream::new();
+
+        let mut reader = transfer_reader(&mut guest, &mut sandbox.mem_mgr.mux, reader);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        sandbox.recreate(snapshot).unwrap();
+
+        let mut bt = [0];
+        assert_matches!(
+            pin!(writer.write(b"x")).poll(&mut cx),
+            Poll::Ready(Err(StreamError::ReaderClosed))
+        );
+        assert_matches!(pin!(reader.read(&mut bt)).poll(&mut cx), Poll::Ready(Ok(0)));
+        sandbox.snapshot().unwrap();
+    }
+
     #[test]
     fn snapshots_reject_noncanonical_transport_after_checkpoint() {
         let mut sandbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
@@ -2275,7 +2459,7 @@ mod tests {
             FunctionCallType::Guest,
             i32::TYPE,
         );
-        sandbox.mem_mgr.write_guest_function_call(&call).unwrap();
+        sandbox.mem_mgr.write_guest_function_call(call).unwrap();
 
         let error = sandbox.dispatch_guest_call_restricted().unwrap_err();
 
@@ -2376,16 +2560,18 @@ mod tests {
         let mut clone =
             Sandbox::from_snapshot(snapshot, crate::HostFunctions::default(), None).unwrap();
         let expected = vec![0x3c; 3 * hyperlight_common::vmem::PAGE_SIZE + 117];
-        let call = FunctionCall::new(
-            "EchoGuestVecBytes".into(),
-            Some(vec![ParameterValue::VecBytes(expected.clone())]),
-            FunctionCallType::Guest,
-            Vec::<u8>::TYPE,
-        );
+        let call = || {
+            FunctionCall::new(
+                "EchoGuestVecBytes".into(),
+                Some(vec![ParameterValue::VecBytes(expected.clone())]),
+                FunctionCallType::Guest,
+                Vec::<u8>::TYPE,
+            )
+        };
 
         for restored in [&mut sandbox, &mut clone] {
             restored.transport_dirty = true;
-            let cid = restored.mem_mgr.write_guest_function_call(&call).unwrap();
+            let cid = restored.mem_mgr.write_guest_function_call(call()).unwrap();
             restored.dispatch_guest_call().unwrap();
             let value = restored
                 .mem_mgr
