@@ -14,6 +14,7 @@ mod arch;
 
 pub mod error;
 pub mod exit;
+pub mod future;
 pub mod layout;
 pub mod paging;
 pub mod prim_alloc;
