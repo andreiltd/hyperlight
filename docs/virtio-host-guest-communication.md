@@ -511,8 +511,8 @@ Transport admission precedes changes to sandbox status, the cached snapshot,
 and memory mappings.
 
 Restore starts a fresh host Mux and ends the current cross-boundary streams.
-Host writers fail with `ReaderClosed`. Host readers reach EOF after their
-buffered bytes.
+Host writers fail with `ReaderClosed`. Host readers fail with `Aborted` after
+their buffered bytes, unless their stream already ended.
 
 Restore writes the arena GPA metadata, a `CheckpointComplete` mailbox value,
 and both ring images into fresh scratch. It attaches new host consumers at
