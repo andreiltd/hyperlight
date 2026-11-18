@@ -91,7 +91,11 @@ impl ReplyCapacity {
     /// Select reply capacity for one host function return type.
     fn for_return_type(return_type: ReturnType) -> Self {
         match return_type {
-            ReturnType::String | ReturnType::VecBytes | ReturnType::ByteChunks => Self::Available,
+            // TODO: Bound tuples without byte elements by their largest encoding.
+            ReturnType::String
+            | ReturnType::VecBytes
+            | ReturnType::ByteChunks
+            | ReturnType::Tuple => Self::Available,
             _ => Self::Bounded(G2H_LOWER_SLOT_SIZE),
         }
     }
@@ -367,7 +371,7 @@ impl GuestContext {
         let has_tasks = !task::status().is_empty();
         let has_status = !self.mux.status().is_empty();
         let has_streams = self.mux.has_live_streams();
-        let moves_reader = result.reader().is_some();
+        let moves_reader = result.readers().next().is_some();
 
         let reserve = usize::from(has_tasks || has_streams || has_status || moves_reader);
 
