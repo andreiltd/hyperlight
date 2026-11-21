@@ -9,6 +9,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 * Add `Sandbox::recreate()`, which rebuilds a sandbox's VM and memory from a snapshot. It recovers unrecoverable sandboxes and keeps configuration, host functions, and interrupt handles by @ludfjig in https://github.com/hyperlight-dev/hyperlight/pull/1751
 
 ### Changed
+* **Breaking:** Snapshots use ABI 12. Guests must be rebuilt and existing
+  snapshots regenerated. Capture and restore provide full H2G bootstrap
+  capacity before guest entry, independent of retained buffers.
 * `Snapshot::save` no longer synchronously flushes files to stable storage.
   Callers requiring power-loss durability must sync the snapshot files and
   directory hierarchy themselves after saving.
