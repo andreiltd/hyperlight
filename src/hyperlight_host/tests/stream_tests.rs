@@ -633,6 +633,55 @@ fn retained_host_replies_leave_lower_slots_for_streams() {
     });
 }
 
+/// Retained guest chunks hold every H2G pool slot, and a drive streams through extra buffers.
+#[test]
+fn retained_guest_byte_chunks_leave_h2g_buffers_for_streams() {
+    let window = DEFAULT_WINDOW.get() as usize;
+    let data: Vec<u8> = (0..4 * window + 17).map(|i| (i % 251) as u8).collect();
+
+    with_rust_sandbox(|mut sandbox| {
+        // Each 1 KiB chunk holds one of the 8 slots of the default H2G pool.
+        for len in 1..=8 {
+            let chunk = Bytes::from(vec![0x5a; 1024]);
+            let retained: i32 = sandbox.call("AppendGuestByteChunks", vec![chunk]).unwrap();
+            assert_eq!(retained, len * 1024);
+        }
+
+        let (input, mut writer) = stream::new();
+        let mut reader: StreamReader<u8> = sandbox.call("EchoStream", input).unwrap();
+
+        let send = async {
+            writer.write_all(&data).await?;
+            writer.close();
+            Ok::<_, DriveError>(())
+        };
+        let receive = async {
+            let mut received = Vec::new();
+
+            while let Some(chunk) = reader.read_chunk().await? {
+                received.extend_from_slice(&chunk);
+            }
+
+            Ok::<_, DriveError>(received)
+        };
+
+        let ((), received) = sandbox
+            .block_on(async { tokio::try_join!(send, receive) })
+            .unwrap();
+
+        assert_eq!(received, data);
+
+        // The request and its spare take all 8 buffers the last progress turn posted.
+        let len: i32 = sandbox
+            .call("ByteChunksLen", vec![Bytes::from(vec![0x3c; 24 * 1024])])
+            .unwrap();
+        assert_eq!(len, 24 * 1024);
+
+        let released: i32 = sandbox.call("ReleaseGuestByteChunks", ()).unwrap();
+        assert_eq!(released, 8 * 1024);
+    });
+}
+
 /// A full H2G queue leaves stream records pending, and each later call sends one more message.
 #[test]
 fn full_h2g_queue_defers_stream_messages() {

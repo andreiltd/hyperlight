@@ -457,6 +457,18 @@ fn retain_guest_byte_chunks(data: Vec<Bytes>) -> i32 {
     len as i32
 }
 
+/// Retain `data` after the bytes already retained, and return the total retained length.
+#[guest_function("AppendGuestByteChunks")]
+fn append_guest_byte_chunks(data: Vec<Bytes>) -> i32 {
+    // SAFETY: the guest is single threaded, so the static has no concurrent access.
+    #[allow(static_mut_refs)]
+    unsafe {
+        let retained = RETAINED_GUEST_CHUNKS.get_or_insert_default();
+        retained.extend(data);
+        retained.iter().map(Bytes::len).sum::<usize>() as i32
+    }
+}
+
 /// Return the retained bytes without releasing their buffers.
 #[guest_function("ReadRetainedGuestByteChunks")]
 fn read_retained_guest_byte_chunks() -> Vec<Bytes> {
